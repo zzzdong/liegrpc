@@ -5,6 +5,7 @@ use hyper::{body::HttpBody, Body};
 use crate::{
     codec::{Decoder, Encoder, ProstDecoder, ProstEncoder},
     metadata::Metadata,
+    status::Status,
 };
 
 pub struct Request<T> {
@@ -74,7 +75,7 @@ where
 }
 
 pub struct Response<T> {
-    decoder: Box<dyn Decoder<Item = T, Error = anyhow::Error> + 'static>,
+    decoder: Box<dyn Decoder<Item = T, Error = Status> + 'static>,
     body: Body,
     buf: BytesMut,
 }
@@ -95,7 +96,7 @@ where
         }
     }
 
-    pub async fn message(&mut self) -> Result<Option<T>, anyhow::Error> {
+    pub async fn message(&mut self) -> Result<Option<T>, Status> {
         while let Some(data) = self.body.data().await {
             match data {
                 Ok(b) => {

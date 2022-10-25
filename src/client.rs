@@ -1,4 +1,7 @@
-use crate::grpc::{Request, Response, SRequest};
+use crate::{
+    grpc::{Request, Response, SRequest},
+    status::Status,
+};
 use futures::Stream;
 use hyper::{client::HttpConnector, Uri};
 
@@ -8,7 +11,7 @@ pub trait GrpcClient {
         &mut self,
         path: &str,
         request: Request<M1>,
-    ) -> anyhow::Result<Response<M2>>
+    ) -> Result<Response<M2>, Status>
     where
         M1: prost::Message,
         M2: prost::Message + Default + 'static;
@@ -17,7 +20,7 @@ pub trait GrpcClient {
         &mut self,
         path: &str,
         request: SRequest<S>,
-    ) -> anyhow::Result<Response<M2>>
+    ) -> Result<Response<M2>, Status>
     where
         S: Stream<Item = M1> + Send + 'static,
         M1: prost::Message,
@@ -50,7 +53,7 @@ impl GrpcClient for Client {
         &mut self,
         path: &str,
         request: Request<M1>,
-    ) -> anyhow::Result<Response<M2>>
+    ) -> Result<Response<M2>, Status>
     where
         M1: prost::Message,
         M2: prost::Message + Default + 'static,
@@ -76,7 +79,7 @@ impl GrpcClient for Client {
         &mut self,
         path: &str,
         request: SRequest<S>,
-    ) -> anyhow::Result<Response<M2>>
+    ) -> Result<Response<M2>, Status>
     where
         S: Stream<Item = M1> + Send + 'static,
         M1: prost::Message,

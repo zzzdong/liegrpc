@@ -6,11 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1"
 async-trait = "0.1"
 bytes = "1.2"
 futures = "0.3"
-tokio = { "version"="1", features=["full"] }
+tokio = { version="1", features=["full"] }
 hyper = { version="0.14", features=["http2", "tcp", "client", "stream" ] }
 hyper-rustls = { version="0.23", features=["native-tokio", "http2", "tls12", "logging"] }
 prost = "0.11"

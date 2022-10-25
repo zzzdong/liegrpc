@@ -2,10 +2,12 @@ use std::marker::PhantomData;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use crate::status::{Code, Status};
+
 const HEADER_SIZE: usize = 5;
 
 pub(crate) trait Encoder {
-    type Error: From<std::io::Error>;
+    type Error;
 
     fn encode<T: prost::Message>(&self, message: &T) -> Result<Bytes, Self::Error>;
 }
@@ -19,7 +21,7 @@ impl ProstEncoder {
 }
 
 impl Encoder for ProstEncoder {
-    type Error = anyhow::Error;
+    type Error = Status;
 
     fn encode<T: prost::Message>(&self, message: &T) -> Result<Bytes, Self::Error> {
         let mut buf = BytesMut::new();
@@ -43,7 +45,7 @@ impl Encoder for ProstEncoder {
 
 pub(crate) trait Decoder {
     type Item: prost::Message + Default;
-    type Error: From<std::io::Error>;
+    type Error;
 
     fn decode(&self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error>;
 }
@@ -62,7 +64,7 @@ impl<T> ProstDecoder<T> {
 
 impl<T: prost::Message + Default> Decoder for ProstDecoder<T> {
     type Item = T;
-    type Error = anyhow::Error;
+    type Error = Status;
 
     fn decode(&self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if buf.len() < HEADER_SIZE {
@@ -70,9 +72,10 @@ impl<T: prost::Message + Default> Decoder for ProstDecoder<T> {
         }
 
         if buf[0] != 0 {
-            return Err(
-                std::io::Error::new(std::io::ErrorKind::Unsupported, "unsupport compress").into(),
-            );
+            return Err(Status::new(
+                Code::Unimplemented,
+                "do not support compression",
+            ));
         }
 
         let i = &buf[1..5];

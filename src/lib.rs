@@ -2,6 +2,7 @@ pub mod client;
 mod codec;
 pub mod grpc;
 pub mod metadata;
+pub mod status;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right
