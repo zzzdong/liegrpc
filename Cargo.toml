@@ -10,6 +10,10 @@ anyhow = "1"
 async-trait = "0.1"
 bytes = "1.2"
 futures = "0.3"
-hyper = { version="0.14", features=["http2", "tcp", "client"] }
-hyper-rustls = { version="0.23", features=["native-tokio", "http2", "tls12", "logging"], default=false }
+tokio = { "version"="1", features=["full"] }
+hyper = { version="0.14", features=["http2", "tcp", "client", "stream" ] }
+hyper-rustls = { version="0.23", features=["native-tokio", "http2", "tls12", "logging"] }
 prost = "0.11"
+
+[dev-dependencies]
+tokio-stream = "0.1.11"
