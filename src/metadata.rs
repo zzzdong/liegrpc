@@ -1,5 +1,10 @@
 use std::collections::BTreeMap;
 
+use crate::{
+    grpc::headers,
+    status::{Code, Status},
+};
+
 const ASCII_HEADER_NAME_TABLE: [bool; 256] = [
     false, false, false, false, false, false, false, false, false, false, false, false, false,
     false, false, false, false, false, false, false, false, false, false, false, false, false,
@@ -45,13 +50,8 @@ const ASCII_HEADER_VALUE_TABLE: [bool; 256] = [
     false, false, false, false,
 ];
 
-pub enum Error {
-    InvalidHeaderName,
-    InvalidHeaderValue,
-}
-
 pub struct Metadata {
-    pub(crate) map: BTreeMap<String, String>,
+    pub(crate) map: BTreeMap<String, Vec<String>>,
 }
 
 impl Metadata {
@@ -61,22 +61,77 @@ impl Metadata {
         }
     }
 
-    pub fn insert(&mut self, name: &str, value: &str) -> Result<&mut Self, Error> {
+    pub fn insert(&mut self, name: &str, value: &str) -> Result<&mut Self, Status> {
+        if name.starts_with(headers::RESREVER_NAME_PREFIX) {
+            return Err(Status::new(Code::InvalidArgument, "invalid header name"));
+        }
+
         for b in name.as_bytes() {
             if !ASCII_HEADER_NAME_TABLE[*b as usize] {
-                return Err(Error::InvalidHeaderName);
+                return Err(Status::new(Code::InvalidArgument, "invalid header name"));
             }
         }
 
         for b in value.as_bytes() {
             if !ASCII_HEADER_VALUE_TABLE[*b as usize] {
-                return Err(Error::InvalidHeaderValue);
+                return Err(Status::new(Code::InvalidArgument, "invalid header value"));
             }
         }
 
-        self.map.insert(name.to_string(), value.to_string());
+        self.map
+            .entry(name.to_string())
+            .or_default()
+            .push(value.to_string());
 
         Ok(self)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Vec<String>> {
+        self.map.get(name)
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<Vec<String>> {
+        self.map.remove(name)
+    }
+
+    pub fn iter(&self) -> Iter {
+        Iter(self.map.iter())
+    }
+}
+
+impl std::ops::Index<&str> for Metadata {
+    type Output = Vec<String>;
+
+    fn index(&self, index: &str) -> &Self::Output {
+        match self.map.get(index) {
+            Some(s) => s,
+            None => {
+                panic!("Metadata[{}] did not exist", index)
+            }
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Metadata {
+    type IntoIter = Iter<'a>;
+    type Item = (&'a str, &'a Vec<String>);
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct Iter<'a>(std::collections::btree_map::Iter<'a, String, Vec<String>>);
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = (&'a str, &'a Vec<String>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(k, v)| (k.as_str(), v))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
 

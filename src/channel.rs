@@ -49,7 +49,7 @@ impl Channel {
         let uri = self
             .uris
             .get(i)
-            .ok_or_else(||Status::new(Code::Internal, "no avaliable target"))?;
+            .ok_or_else(|| Status::new(Code::Internal, "no avaliable target"))?;
 
         let uri = Uri::builder()
             .scheme(uri.scheme().expect("scheme must not empty").clone())

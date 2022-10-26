@@ -50,13 +50,11 @@ impl GrpcClient for Client {
         M1: prost::Message,
         M2: prost::Message + Default + 'static,
     {
-        let req = request.into_http();
+        let req = request.into_http()?;
 
         let resp = self.channel.call(path, req).await?;
 
-        let resp = Response::from_http(resp);
-
-        Ok(resp)
+        Response::from_http(resp)
     }
 
     async fn streaming<M1, M2, S>(
@@ -73,8 +71,6 @@ impl GrpcClient for Client {
 
         let resp = self.channel.call(path, req).await?;
 
-        let resp = Response::from_http(resp);
-
-        Ok(resp)
+        Response::from_http(resp)
     }
 }
