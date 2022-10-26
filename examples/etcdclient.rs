@@ -1281,8 +1281,8 @@ use liegrpc::{
 
 #[tokio::main]
 async fn main() {
-    let uri = "http://127.0.0.1:2379".parse().unwrap();
-    let mut client = liegrpc::client::Client::new(uri);
+    let uri = "http://127.0.0.1:2379";
+    let mut client = liegrpc::client::Client::new([uri].iter()).unwrap();
 
     let mut req = RangeRequest::default();
 

@@ -1,9 +1,9 @@
 use crate::{
+    channel::Channel,
     grpc::{Request, Response, SRequest},
     status::Status,
 };
 use futures::Stream;
-use hyper::{client::HttpConnector, Uri};
 
 #[async_trait::async_trait]
 pub trait GrpcClient {
@@ -28,22 +28,14 @@ pub trait GrpcClient {
 }
 
 pub struct Client {
-    inner: hyper::Client<hyper_rustls::HttpsConnector<HttpConnector>>,
-    base_uri: Uri,
+    channel: Channel,
 }
 
 impl Client {
-    pub fn new(base_uri: Uri) -> Self {
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .https_or_http()
-            .enable_http2()
-            .build();
+    pub fn new(target: impl Iterator<Item = impl AsRef<str>>) -> Result<Self, Status> {
+        let channel = Channel::new(target)?;
 
-        Client {
-            base_uri,
-            inner: hyper::Client::builder().http2_only(true).build(https),
-        }
+        Ok(Client { channel })
     }
 }
 
@@ -58,17 +50,9 @@ impl GrpcClient for Client {
         M1: prost::Message,
         M2: prost::Message + Default + 'static,
     {
-        let mut req = request.into_http();
+        let req = request.into_http();
 
-        let uri = hyper::Uri::builder()
-            .scheme(self.base_uri.scheme().unwrap().clone())
-            .authority(self.base_uri.authority().unwrap().clone())
-            .path_and_query(path)
-            .build()
-            .unwrap();
-
-        *req.uri_mut() = uri;
-        let resp = self.inner.request(req).await?;
+        let resp = self.channel.call(path, req).await?;
 
         let resp = Response::from_http(resp);
 
@@ -85,17 +69,9 @@ impl GrpcClient for Client {
         M1: prost::Message,
         M2: prost::Message + Default + 'static,
     {
-        let mut req = request.into_http();
+        let req = request.into_http();
 
-        let uri = hyper::Uri::builder()
-            .scheme(self.base_uri.scheme().unwrap().clone())
-            .authority(self.base_uri.authority().unwrap().clone())
-            .path_and_query(path)
-            .build()
-            .unwrap();
-
-        *req.uri_mut() = uri;
-        let resp = self.inner.request(req).await?;
+        let resp = self.channel.call(path, req).await?;
 
         let resp = Response::from_http(resp);
 

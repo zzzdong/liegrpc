@@ -18,8 +18,8 @@ pub struct HelloReply {
 
 #[tokio::main]
 async fn main() {
-    let uri = "http://127.0.0.1:50001".parse().unwrap();
-    let mut client = liegrpc::client::Client::new(uri);
+    let uri = "http://127.0.0.1:50001";
+    let mut client = liegrpc::client::Client::new([uri].iter()).unwrap();
 
     let req = Request::new(HelloRequest {
         name: "tom".to_owned(),
