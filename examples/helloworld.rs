@@ -25,12 +25,12 @@ async fn main() {
         name: "tom".to_owned(),
     });
 
-    let mut rsp: Response<HelloReply> = client
-        .unary("/helloworld.Greeter/SayHello", req)
+    let rsp: Response<HelloReply> = client
+        .unary_unary("/helloworld.Greeter/SayHello", req)
         .await
         .unwrap();
 
-    let msg = rsp.message().await.unwrap();
+    let msg = rsp.get_ref();
 
     println!("=> {:?}", msg);
 }

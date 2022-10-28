@@ -1274,9 +1274,10 @@ impl AlarmType {
     }
 }
 
+use futures::StreamExt;
 use liegrpc::{
     client::GrpcClient,
-    grpc::{Request, Response, SRequest},
+    grpc::{Request, Response, Streaming},
 };
 
 #[tokio::main]
@@ -1290,10 +1291,12 @@ async fn main() {
 
     let req = Request::new(req);
 
-    let mut rsp: Response<RangeResponse> =
-        client.unary("/etcdserverpb.KV/Range", req).await.unwrap();
+    let rsp: Response<RangeResponse> = client
+        .unary_unary("/etcdserverpb.KV/Range", req)
+        .await
+        .unwrap();
 
-    let msg = rsp.message().await.unwrap();
+    let msg = rsp.get_ref();
 
     println!("=> {:?}", msg);
 
@@ -1312,16 +1315,14 @@ async fn main() {
 
     let rx = tokio_stream::wrappers::ReceiverStream::new(req_rx);
 
-    let req = SRequest::new(rx);
+    let req = Request::new(rx);
 
-    let mut rsp: Response<WatchResponse> = client
-        .streaming("/etcdserverpb.Watch/Watch", req)
+    let mut rsp: Response<Streaming<WatchResponse>> = client
+        .streaming_streaming("/etcdserverpb.Watch/Watch", req)
         .await
         .unwrap();
 
-    loop {
-        let msg = rsp.message().await.unwrap();
-
-        println!("watch => {:?}", msg);
+    while let Some(m) = rsp.get_mut().next().await {
+        println!("watch => {:?}", m);
     }
 }

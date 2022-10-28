@@ -50,6 +50,7 @@ const ASCII_HEADER_VALUE_TABLE: [bool; 256] = [
     false, false, false, false,
 ];
 
+#[derive(Debug, Clone)]
 pub struct Metadata {
     pub(crate) map: BTreeMap<String, Vec<String>>,
 }
@@ -58,6 +59,13 @@ impl Metadata {
     pub fn new() -> Self {
         Metadata {
             map: BTreeMap::new(),
+        }
+    }
+
+    pub fn merge_http_header(&mut self, headers: &hyper::HeaderMap) {
+        for (k, v) in headers {
+            // ignore invalid header
+            let _ = self.insert(k.as_str(), String::from_utf8_lossy(v.as_bytes()).as_ref());
         }
     }
 

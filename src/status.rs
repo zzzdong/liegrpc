@@ -31,7 +31,7 @@ impl Code {
     pub fn from_bytes(b: &[u8]) -> Result<Self, Status> {
         match b.len() {
             1 if b[0].is_ascii_digit() => Code::try_from(b[0] - b'0'),
-            2 if b[0].is_ascii_digit() && b[1].is_ascii_digit() => {
+            2 if b[0] == b'1' && b[1].is_ascii_digit() => {
                 let code = (b[0] - b'0') * 10;
                 let code = code + b[1] - b'0';
                 Code::try_from(code)
@@ -82,9 +82,9 @@ impl FromStr for Code {
     type Err = Status;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let code = s.parse::<u8>().map_err(|err| {
-            Status::new(Code::Internal, "parse grpc-status failed").with_cause(err)
-        })?;
+        let code = s
+            .parse::<u8>()
+            .map_err(|err| Status::internal("parse grpc-status failed").with_cause(err))?;
 
         Code::try_from(code)
     }
@@ -148,7 +148,7 @@ impl Status {
     pub fn from_header_map(headers: &hyper::HeaderMap) -> Result<Status, Status> {
         let code = headers
             .get(headers::GRPC_STATUS)
-            .ok_or_else(|| Status::new(Code::Internal, "invalid grpc-status({:?})"))?;
+            .ok_or_else(|| Status::internal("grpc-status not found"))?;
         let code = Code::from_bytes(code.as_bytes())?;
 
         // message can be empty
@@ -163,6 +163,10 @@ impl Status {
             .unwrap_or_default();
 
         Ok(Status::new(code, message).with_detail(detail))
+    }
+
+    pub fn internal(message: impl ToString) -> Self {
+        Self::new(Code::Internal, message)
     }
 }
 
@@ -180,18 +184,18 @@ impl std::error::Error for Status {}
 
 impl From<hyper::Error> for Status {
     fn from(err: hyper::Error) -> Self {
-        Status::new(Code::Internal, "http2 failed").with_cause(err)
+        Status::internal("http2 failed").with_cause(err)
     }
 }
 
 impl From<prost::EncodeError> for Status {
     fn from(err: prost::EncodeError) -> Self {
-        Status::new(Code::Internal, "prost encode failed").with_cause(err)
+        Status::internal("prost encode failed").with_cause(err)
     }
 }
 
 impl From<prost::DecodeError> for Status {
     fn from(err: prost::DecodeError) -> Self {
-        Status::new(Code::Internal, "prost decode failed").with_cause(err)
+        Status::internal("prost decode failed").with_cause(err)
     }
 }
