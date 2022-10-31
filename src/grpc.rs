@@ -29,6 +29,14 @@ impl<T> Request<T> {
             metadata: Metadata::new(),
         }
     }
+
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    pub fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
+    }
 }
 
 impl<T: Clone> Clone for Request<T> {
@@ -90,16 +98,20 @@ impl<T> Response<T> {
         Response { message, metadata }
     }
 
-    pub fn metadata(&self) -> &Metadata {
-        &self.metadata
-    }
-
     pub fn get_ref(&self) -> &T {
         &self.message
     }
 
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.message
+    }
+
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    pub fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
     }
 
     pub fn into_parts(self) -> (Metadata, T) {
@@ -144,6 +156,10 @@ where
 
         Ok(Response { message, metadata })
     }
+
+    pub fn message(&self) -> &T {
+        &self.message
+    }
 }
 
 impl<M> Response<Streaming<M>>
@@ -170,6 +186,10 @@ where
             message: streaming,
             metadata,
         })
+    }
+
+    pub fn message_stream(&mut self) -> impl Stream<Item = Result<M, Status>> + '_ {
+        &mut self.message
     }
 
     pub async fn recv_message(&mut self) -> Result<Option<M>, Status> {

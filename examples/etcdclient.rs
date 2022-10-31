@@ -1322,7 +1322,11 @@ async fn main() {
         .await
         .unwrap();
 
-    while let Some(m) = rsp.get_mut().next().await {
+    let mut message_stream = rsp.message_stream();
+
+    while let Some(m) = message_stream.next().await {
         println!("watch => {:?}", m);
     }
+
+
 }

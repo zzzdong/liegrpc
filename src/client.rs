@@ -17,6 +17,25 @@ pub trait GrpcClient {
         M1: prost::Message,
         M2: prost::Message + Default + 'static;
 
+    async fn unary_streaming<M1, M2>(
+        &mut self,
+        path: &str,
+        request: Request<M1>,
+    ) -> Result<Response<Streaming<M2>>, Status>
+    where
+        M1: prost::Message,
+        M2: prost::Message + Default + 'static;
+
+    async fn streaming_unary<M1, M2, S1>(
+        &mut self,
+        path: &str,
+        request: Request<S1>,
+    ) -> Result<Response<M2>, Status>
+    where
+        S1: Stream<Item = M1> + Send + 'static,
+        M1: prost::Message,
+        M2: prost::Message + Default + 'static;
+
     async fn streaming_streaming<M1, M2, S1>(
         &mut self,
         path: &str,
@@ -52,6 +71,39 @@ impl GrpcClient for Client {
         M2: prost::Message + Default + 'static,
     {
         let req = request.into_unary()?;
+
+        let resp = self.channel.call(path, req).await?;
+
+        Response::new_unary(resp).await
+    }
+
+    async fn unary_streaming<M1, M2>(
+        &mut self,
+        path: &str,
+        request: Request<M1>,
+    ) -> Result<Response<Streaming<M2>>, Status>
+    where
+        M1: prost::Message,
+        M2: prost::Message + Default + 'static,
+    {
+        let req = request.into_unary()?;
+
+        let resp = self.channel.call(path, req).await?;
+
+        Response::new_streaming(resp).await
+    }
+
+    async fn streaming_unary<M1, M2, S1>(
+        &mut self,
+        path: &str,
+        request: Request<S1>,
+    ) -> Result<Response<M2>, Status>
+    where
+        S1: Stream<Item = M1> + Send + 'static,
+        M1: prost::Message,
+        M2: prost::Message + Default + 'static,
+    {
+        let req = request.into_stream();
 
         let resp = self.channel.call(path, req).await?;
 
