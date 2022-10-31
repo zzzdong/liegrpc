@@ -6,7 +6,7 @@ use hyper::{body::HttpBody, Body, HeaderMap};
 
 use crate::{
     codec::{Decoder, Encoder, ProstDecoder, ProstEncoder},
-    metadata::Metadata,
+    metadata::MetadataMap,
     status::Status,
 };
 
@@ -19,22 +19,22 @@ pub mod headers {
 
 pub struct Request<T> {
     message: T,
-    metadata: Metadata,
+    metadata: MetadataMap,
 }
 
 impl<T> Request<T> {
     pub fn new(message: T) -> Self {
         Request {
             message,
-            metadata: Metadata::new(),
+            metadata: MetadataMap::new(),
         }
     }
 
-    pub fn metadata(&self) -> &Metadata {
+    pub fn metadata(&self) -> &MetadataMap {
         &self.metadata
     }
 
-    pub fn metadata_mut(&mut self) -> &mut Metadata {
+    pub fn metadata_mut(&mut self) -> &mut MetadataMap {
         &mut self.metadata
     }
 }
@@ -73,7 +73,7 @@ where
     }
 }
 
-fn into_http(metadata: &Metadata, body: Body) -> hyper::Request<Body> {
+fn into_http(metadata: &MetadataMap, body: Body) -> hyper::Request<Body> {
     let mut builder = hyper::Request::builder()
         .version(hyper::Version::HTTP_2)
         .method(hyper::Method::POST)
@@ -90,11 +90,11 @@ fn into_http(metadata: &Metadata, body: Body) -> hyper::Request<Body> {
 
 pub struct Response<T> {
     message: T,
-    metadata: Metadata,
+    metadata: MetadataMap,
 }
 
 impl<T> Response<T> {
-    pub fn new(metadata: Metadata, message: T) -> Self {
+    pub fn new(metadata: MetadataMap, message: T) -> Self {
         Response { message, metadata }
     }
 
@@ -106,15 +106,15 @@ impl<T> Response<T> {
         &mut self.message
     }
 
-    pub fn metadata(&self) -> &Metadata {
+    pub fn metadata(&self) -> &MetadataMap {
         &self.metadata
     }
 
-    pub fn metadata_mut(&mut self) -> &mut Metadata {
+    pub fn metadata_mut(&mut self) -> &mut MetadataMap {
         &mut self.metadata
     }
 
-    pub fn into_parts(self) -> (Metadata, T) {
+    pub fn into_parts(self) -> (MetadataMap, T) {
         (self.metadata, self.message)
     }
 }
@@ -151,7 +151,7 @@ where
             return Err(status);
         }
 
-        let mut metadata = Metadata::new();
+        let mut metadata = MetadataMap::new();
         metadata.merge_http_header(&parts.headers);
 
         Ok(Response { message, metadata })
@@ -176,7 +176,7 @@ where
             }
         }
 
-        let mut metadata = Metadata::new();
+        let mut metadata = MetadataMap::new();
 
         metadata.merge_http_header(&parts.headers);
 

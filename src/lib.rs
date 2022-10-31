@@ -8,5 +8,5 @@ pub mod status;
 pub use channel::Channel;
 pub use client::Client;
 pub use grpc::{Request, Response};
-pub use metadata::Metadata;
+pub use metadata::MetadataMap;
 pub use status::Status;

@@ -5,59 +5,14 @@ use crate::{
     status::{Code, Status},
 };
 
-const ASCII_HEADER_NAME_TABLE: [bool; 256] = [
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, true, true, false, true, true, true, true, true,
-    true, true, true, true, true, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, true, false, true, true, true, true, true, true, true, true, true, true, true,
-    true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false,
-];
-
-const ASCII_HEADER_VALUE_TABLE: [bool; 256] = [
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, true, true, true, true, true, true, true, true, true,
-    true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-    true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-    true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-    true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-    true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-    true, true, true, true, true, true, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false,
-];
-
 #[derive(Debug, Clone)]
-pub struct Metadata {
+pub struct MetadataMap {
     pub(crate) map: BTreeMap<String, Vec<String>>,
 }
 
-impl Metadata {
+impl MetadataMap {
     pub fn new() -> Self {
-        Metadata {
+        MetadataMap {
             map: BTreeMap::new(),
         }
     }
@@ -74,14 +29,16 @@ impl Metadata {
             return Err(Status::new(Code::InvalidArgument, "invalid header name"));
         }
 
-        for b in name.as_bytes() {
-            if !ASCII_HEADER_NAME_TABLE[*b as usize] {
+        for b in name.chars() {
+            // Header-Name → 1*( %x30-39 / %x61-7A / "_" / "-" / ".") ; 0-9 a-z _ - .
+            if !matches!(b, '0'..='9' | 'a'..='z' | '_' | '-' | '.') {
                 return Err(Status::new(Code::InvalidArgument, "invalid header name"));
             }
         }
 
-        for b in value.as_bytes() {
-            if !ASCII_HEADER_VALUE_TABLE[*b as usize] {
+        for b in value.chars() {
+            // ASCII-Value → 1*( %x20-%x7E ) ; space and printable ASCII
+            if !matches!(b, ' '..='~') {
                 return Err(Status::new(Code::InvalidArgument, "invalid header value"));
             }
         }
@@ -98,6 +55,10 @@ impl Metadata {
         self.map.get(name)
     }
 
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Vec<String>> {
+        self.map.get_mut(name)
+    }
+
     pub fn remove(&mut self, name: &str) -> Option<Vec<String>> {
         self.map.remove(name)
     }
@@ -107,20 +68,20 @@ impl Metadata {
     }
 }
 
-impl std::ops::Index<&str> for Metadata {
+impl std::ops::Index<&str> for MetadataMap {
     type Output = Vec<String>;
 
     fn index(&self, index: &str) -> &Self::Output {
         match self.map.get(index) {
             Some(s) => s,
             None => {
-                panic!("Metadata[{}] did not exist", index)
+                panic!("MetadataMap[{}] did not exist", index)
             }
         }
     }
 }
 
-impl<'a> IntoIterator for &'a Metadata {
+impl<'a> IntoIterator for &'a MetadataMap {
     type IntoIter = Iter<'a>;
     type Item = (&'a str, &'a Vec<String>);
 
@@ -143,9 +104,9 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-impl Default for Metadata {
+impl Default for MetadataMap {
     fn default() -> Self {
-        Metadata::new()
+        MetadataMap::new()
     }
 }
 
