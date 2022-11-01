@@ -257,28 +257,21 @@ where
     fn poll_message(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Option<Result<T, Status>>> {
         match Pin::new(&mut self.body).poll_data(cx) {
             Poll::Ready(b) => {
-                match b {
-                    Some(bs) => match bs {
-                        Ok(bb) => {
-                            self.buf.put(bb);
+                if let Some(bs) = b {
+                    match bs {
+                        Ok(buf) => {
+                            self.buf.put(buf);
                         }
                         Err(err) => return Poll::Ready(Some(Err(err.into()))),
-                    },
-                    None => return Poll::Ready(None),
-                }
+                    }
+                };
 
                 match self.decoder.decode(&mut self.buf) {
                     Ok(ret) => match ret {
-                        Some(m) => {
-                            return Poll::Ready(Some(Ok(m)));
-                        }
-                        None => {
-                            return Poll::Pending;
-                        }
+                        Some(m) => Poll::Ready(Some(Ok(m))),
+                        None => Poll::Pending,
                     },
-                    Err(err) => {
-                        return Poll::Ready(Some(Err(err)));
-                    }
+                    Err(err) => Poll::Ready(Some(Err(err))),
                 }
             }
             Poll::Pending => Poll::Pending,
