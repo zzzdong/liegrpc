@@ -15,6 +15,8 @@ pub mod headers {
     pub const GRPC_MESSAGE: &str = "grpc-message";
     pub const GRPC_STATUS_DETAIL_BIN: &str = "grpc-status-details-bin";
     pub const RESREVER_NAME_PREFIX: &str = "grpc-";
+
+    pub const APPLICATION_GRPC_PROTO: &str = "application/grpc+proto";
 }
 
 pub struct Request<T> {
@@ -55,7 +57,7 @@ impl<T: prost::Message> Request<T> {
         let m = encoder.encode(&self.message)?;
         let payload = Body::from(m);
 
-        Ok(into_http(&self.metadata, payload))
+        Ok(into_http_request(&self.metadata, payload))
     }
 }
 
@@ -69,19 +71,19 @@ where
 
         let payload = Body::wrap_stream(s);
 
-        into_http(&self.metadata, payload)
+        into_http_request(&self.metadata, payload)
     }
 }
 
-fn into_http(metadata: &MetadataMap, body: Body) -> hyper::Request<Body> {
+fn into_http_request(metadata: &MetadataMap, body: Body) -> hyper::Request<Body> {
     let mut builder = hyper::Request::builder()
         .version(hyper::Version::HTTP_2)
         .method(hyper::Method::POST)
-        .header("Content-Type", "application/grpc+proto");
+        .header(hyper::http::header::CONTENT_TYPE, headers::APPLICATION_GRPC_PROTO);
 
-    for (k, v) in metadata {
-        for vv in v {
-            builder = builder.header(k, vv);
+    for (k, vv) in metadata {
+        for v in vv {
+            builder = builder.header(k, v);
         }
     }
 

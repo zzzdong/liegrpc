@@ -7,23 +7,29 @@ use crate::status::{Code, Status};
 const HEADER_SIZE: usize = 5;
 
 pub(crate) trait Encoder {
+    type Item: prost::Message;
     type Error;
 
-    fn encode<T: prost::Message>(&self, message: &T) -> Result<Bytes, Self::Error>;
+    fn encode(&self, message: &Self::Item) -> Result<Bytes, Self::Error>;
 }
 
-pub(crate) struct ProstEncoder {}
+pub(crate) struct ProstEncoder<T> {
+    message: PhantomData<T>,
+}
 
-impl ProstEncoder {
+impl<T> ProstEncoder<T> {
     pub fn new() -> Self {
-        ProstEncoder {}
+        ProstEncoder {
+            message: PhantomData::default(),
+        }
     }
 }
 
-impl Encoder for ProstEncoder {
+impl<T: prost::Message> Encoder for ProstEncoder<T> {
+    type Item = T;
     type Error = Status;
 
-    fn encode<T: prost::Message>(&self, message: &T) -> Result<Bytes, Self::Error> {
+    fn encode(&self, message: &T) -> Result<Bytes, Self::Error> {
         let mut buf = BytesMut::new();
 
         // reserver header
