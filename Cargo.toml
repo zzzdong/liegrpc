@@ -10,8 +10,13 @@ async-trait = "0.1"
 bytes = "1.2"
 futures = "0.3"
 tokio = { version="1", features=["full"] }
-hyper = { version="0.14", features=["http2", "tcp", "client", "stream" ] }
-hyper-rustls = { version="0.23", features=["native-tokio", "http2", "tls12", "logging"] }
+hyper = { version="1.0.0-rc.3", features=["http2", "client" ] }
+# http-body = { git = "https://github.com/hyperium/http-body.git", package = "http-body" }
+# http-body-util = { git = "https://github.com/hyperium/http-body.git", package = "http-body-util" }
+http-body = { version="1.0.0-rc.2" }
+http-body-util = { version="0.1.0-rc.2" }
+hyper-util = { git = "https://github.com/hyperium/hyper-util.git" }
+# hyper-rustls = { version="0.23", features=["native-tokio", "http2", "tls12", "logging"] }
 prost = "0.11"
 rand = "0.8"
 

@@ -182,6 +182,13 @@ impl fmt::Display for Status {
 
 impl std::error::Error for Status {}
 
+impl From<std::io::Error> for Status {
+    fn from(err: std::io::Error) -> Self {
+        Status::internal("io error").with_cause(err)
+    }
+}
+
+
 impl From<hyper::Error> for Status {
     fn from(err: hyper::Error) -> Self {
         Status::internal("http2 failed").with_cause(err)

@@ -1,8 +1,13 @@
 use std::{pin::Pin, task::Poll};
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use futures::{Stream, StreamExt};
-use hyper::{body::HttpBody, Body, HeaderMap};
+use http_body::Frame;
+use http_body_util::{BodyExt, StreamBody};
+use hyper::{
+    body::{Body, Incoming},
+    HeaderMap,
+};
 
 use crate::{
     codec::{Decoder, Encoder, ProstDecoder, ProstEncoder},
@@ -51,13 +56,15 @@ impl<T: Clone> Clone for Request<T> {
 }
 
 impl<T: prost::Message> Request<T> {
-    pub fn into_unary(self) -> Result<hyper::Request<Body>, Status> {
+    pub fn into_unary(self) -> Result<hyper::Request<impl Body + 'static>, Status> {
+        let Request { message, metadata } = self;
+
         let encoder = ProstEncoder::new();
 
-        let m = encoder.encode(&self.message)?;
-        let payload = Body::from(m);
+        let buf = encoder.encode(&message)?;
+        let payload = http_body_util::Full::new(buf);
 
-        Ok(into_http_request(&self.metadata, payload))
+        Ok(into_http_request(metadata, payload))
     }
 }
 
@@ -66,22 +73,30 @@ where
     S: Stream<Item = M> + Send + 'static,
     M: prost::Message,
 {
-    pub fn into_stream(self) -> hyper::Request<Body> {
-        let s = self.message.map(|m| ProstEncoder::new().encode(&m));
+    pub fn into_stream(self) -> hyper::Request<impl Body + 'static> {
+        let Request { metadata, message } = self;
 
-        let payload = Body::wrap_stream(s);
+        let s = message.map(|m| ProstEncoder::new().encode(&m).map(|b| Frame::data(b)));
 
-        into_http_request(&self.metadata, payload)
+        let payload = StreamBody::new(s);
+
+        into_http_request(metadata, payload)
     }
 }
 
-fn into_http_request(metadata: &MetadataMap, body: Body) -> hyper::Request<Body> {
+fn into_http_request(
+    metadata: MetadataMap,
+    body: impl Body + 'static,
+) -> hyper::Request<impl Body + 'static> {
     let mut builder = hyper::Request::builder()
         .version(hyper::Version::HTTP_2)
         .method(hyper::Method::POST)
-        .header(hyper::http::header::CONTENT_TYPE, headers::APPLICATION_GRPC_PROTO);
+        .header(
+            hyper::http::header::CONTENT_TYPE,
+            headers::APPLICATION_GRPC_PROTO,
+        );
 
-    for (k, vv) in metadata {
+    for (k, vv) in &metadata {
         for v in vv {
             builder = builder.header(k, v);
         }
@@ -125,7 +140,7 @@ impl<T> Response<T>
 where
     T: prost::Message + Default + 'static,
 {
-    pub async fn new_unary(resp: hyper::Response<Body>) -> Result<Self, Status> {
+    pub async fn new_unary(resp: hyper::Response<Incoming>) -> Result<Self, Status> {
         let (mut parts, body) = resp.into_parts();
 
         if parts.status != hyper::StatusCode::OK {
@@ -143,9 +158,8 @@ where
             .ok_or_else(|| Status::internal("expect first message"))?;
 
         // when unary, should wait for trailer
-        if let Some(trailer) = streaming.recv_trailers().await? {
-            parts.headers.extend(trailer);
-        }
+        let trailers = streaming.recv_trailers().await?;
+        parts.headers.extend(streaming.take_trailers());
 
         // status from header and trailer.
         let status = Status::from_header_map(&parts.headers)?;
@@ -168,7 +182,7 @@ impl<M> Response<Streaming<M>>
 where
     M: prost::Message + Default + 'static,
 {
-    pub async fn new_streaming(resp: hyper::Response<Body>) -> Result<Self, Status> {
+    pub async fn new_streaming(resp: hyper::Response<Incoming>) -> Result<Self, Status> {
         let (parts, body) = resp.into_parts();
 
         if parts.status != hyper::StatusCode::OK {
@@ -198,7 +212,7 @@ where
         self.message.recv_message().await
     }
 
-    pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, Status> {
+    pub async fn recv_trailers(&mut self) -> Result<&HeaderMap, Status> {
         self.message.recv_trailers().await
     }
 }
@@ -214,37 +228,48 @@ impl<T: Clone> Clone for Response<T> {
 
 pub struct Streaming<T> {
     decoder: Box<dyn Decoder<Item = T, Error = Status> + Send + 'static>,
-    body: Body,
+    body: Incoming,
     buf: BytesMut,
+    trailers: HeaderMap,
 }
 
 impl<T> Streaming<T>
 where
     T: prost::Message + Default + 'static,
 {
-    pub fn new(body: hyper::Body) -> Self {
+    pub fn new(body: Incoming) -> Self {
         let decoder = Box::new(ProstDecoder::new());
 
         Streaming {
             decoder,
             body,
             buf: BytesMut::new(),
+            trailers: HeaderMap::new(),
         }
     }
 
-    pub async fn recv_message(&mut self) -> Result<Option<T>, Status> {
-        while let Some(data) = self.body.data().await {
-            match data {
-                Ok(b) => {
-                    self.buf.extend(b);
+    pub(crate) fn take_trailers(self) -> HeaderMap {
+        self.trailers
+    }
 
-                    match self.decoder.decode(&mut self.buf)? {
-                        Some(m) => {
-                            return Ok(Some(m));
+    pub async fn recv_message(&mut self) -> Result<Option<T>, Status> {
+        while let Some(frame) = self.body.frame().await {
+            match frame {
+                Ok(f) => {
+                    if f.is_data() {
+                        let data = f.into_data().expect("frame is not data kind");
+                        self.buf.extend(data);
+
+                        match self.decoder.decode(&mut self.buf)? {
+                            Some(m) => {
+                                return Ok(Some(m));
+                            }
+                            None => {
+                                continue;
+                            }
                         }
-                        None => {
-                            continue;
-                        }
+                    } else {
+                        return Err(Status::internal("unknown frame when recv message"));
                     }
                 }
                 Err(err) => {
@@ -256,13 +281,43 @@ where
         Ok(None)
     }
 
+    pub async fn recv_trailers(&mut self) -> Result<&HeaderMap, Status> {
+        while let Some(frame) = self.body.frame().await {
+            match frame {
+                Ok(f) => {
+                    if f.is_trailers() {
+                        let trailers = f.into_trailers().expect("frame is not trailers kind");
+                        self.trailers.extend(trailers);
+                    } else {
+                        return Err(Status::internal("unknown frame when recv trailers"));
+                    }
+                }
+                Err(err) => {
+                    return Err(err.into());
+                }
+            }
+        }
+
+        Ok(&self.trailers)
+    }
+
     fn poll_message(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Option<Result<T, Status>>> {
-        match Pin::new(&mut self.body).poll_data(cx) {
+        match Pin::new(&mut self.body).poll_frame(cx) {
             Poll::Ready(b) => {
                 if let Some(bs) = b {
                     match bs {
-                        Ok(buf) => {
-                            self.buf.put(buf);
+                        Ok(f) => {
+                            if f.is_data() {
+                                let data = f.into_data().expect("frame is not data kind");
+                                self.buf.extend(data);
+                            } else if f.is_trailers() {
+                                let trailers =
+                                    f.into_trailers().expect("frame is not trailer kind");
+                                self.trailers.extend(trailers);
+
+                                // when trailers, end of messages
+                                return Poll::Ready(None);
+                            }
                         }
                         Err(err) => return Poll::Ready(Some(Err(err.into()))),
                     }
@@ -278,10 +333,6 @@ where
             }
             Poll::Pending => Poll::Pending,
         }
-    }
-
-    pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, Status> {
-        self.body.trailers().await.map_err(Into::into)
     }
 }
 
