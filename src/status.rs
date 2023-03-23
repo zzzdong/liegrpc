@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, convert::Infallible};
 
 use bytes::Bytes;
 use hyper::http;
@@ -182,12 +182,17 @@ impl fmt::Display for Status {
 
 impl std::error::Error for Status {}
 
+impl From<Infallible> for Status {
+    fn from(err: Infallible) -> Self {
+        Status::internal("Infallible").with_cause(err)
+    }
+}
+
 impl From<std::io::Error> for Status {
     fn from(err: std::io::Error) -> Self {
         Status::internal("io error").with_cause(err)
     }
 }
-
 
 impl From<hyper::Error> for Status {
     fn from(err: hyper::Error) -> Self {
@@ -206,3 +211,4 @@ impl From<prost::DecodeError> for Status {
         Status::internal("prost decode failed").with_cause(err)
     }
 }
+

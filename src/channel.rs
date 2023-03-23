@@ -1,95 +1,111 @@
 use std::collections::BTreeMap;
-use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use futures::Stream;
+use http_body::Frame;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{Full, StreamBody};
 use hyper::body::Incoming;
 use hyper::client::conn::http2::{self, handshake, Builder, SendRequest};
 use hyper::{body::Body, Request, Response, Uri};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 
-use crate::status::{Code, Status};
+use crate::status::{self, Code, Status};
 
 static AUTO_ID: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ChannelID(usize);
+#[derive(Debug, Clone)]
+pub struct Channel {
+    tx: mpsc::UnboundedSender<(
+        Request<BoxBody>,
+        oneshot::Sender<Result<Response<Incoming>, Status>>,
+    )>,
+}
 
-impl ChannelID {
-    pub fn next_id() -> ChannelID {
-        let id = AUTO_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ChannelID(id)
+impl Channel {
+    pub fn new(target: impl Iterator<Item = impl AsRef<str>>) -> Result<Channel, Status> {
+        let mut uris = Vec::new();
+
+        for item in target {
+            let uri = Uri::try_from(item.as_ref())
+                .map_err(|err| Status::new(Code::InvalidArgument, "invalid uri").with_cause(err))?;
+
+            if uri.authority().is_none() || uri.scheme().is_none() {
+                return Err(Status::new(Code::InvalidArgument, "invalid uri"));
+            }
+            uris.push(uri);
+        }
+
+        if uris.is_empty() {
+            return Err(Status::new(Code::InvalidArgument, "invalid target"));
+        }
+
+        let manager = ConnectionManager::new(uris, Credential::InSecure);
+
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let manager = ChannelManager { rx, manager };
+
+        tokio::task::spawn(async move { manager.dispatch().await });
+
+        Ok(Channel { tx })
+    }
+
+    pub async fn call(
+        &mut self,
+        method: Uri,
+        mut request: Request<BoxBody>,
+    ) -> Result<Response<Incoming>, Status> {
+        *request.uri_mut() = method;
+
+        let (tx, rx) = oneshot::channel();
+
+        let resp = self.tx.send((request, tx));
+
+        rx.await.unwrap()
     }
 }
 
-// #[derive(Debug, Clone)]
-// pub struct Channel<B> {
-//     conns: Vec<SendRequest<B>>,
-//     uris: Vec<Uri>,
-// }
+struct ChannelManager {
+    rx: mpsc::UnboundedReceiver<(
+        Request<BoxBody>,
+        oneshot::Sender<Result<Response<Incoming>, Status>>,
+    )>,
+    manager: ConnectionManager,
+}
 
-// impl<B> Channel<B>
-// where
-//     B: Body + 'static,
-// {
-//     pub fn new(target: impl Iterator<Item = impl AsRef<str>>) -> Result<Self, Status> {
-//         let mut uris = Vec::new();
+impl ChannelManager {
+    pub async fn dispatch(&mut self) {
+        while let Some((req, tx)) = self.rx.recv().await {
+            let conn = self.manager.request_connection().await;
 
-//         for item in target {
-//             let uri = Uri::try_from(item.as_ref())
-//                 .map_err(|err| Status::new(Code::InvalidArgument, "invalid uri").with_cause(err))?;
+            match conn {
+                Ok(conn) => {
+                    let SubChannel {
+                        state,
+                        state_tx,
+                        sender,
+                        ..
+                    } = conn.clone();
+                    tokio::task::spawn(async move {
+                        let ret = sender.unwrap().send_request(req).await.map_err(Into::into);
+                        tx.send(ret);
+                    });
+                }
+                Err(err) => {
+                    tx.send(Err(err));
+                }
+            }
+        }
+    }
+}
 
-//             if uri.authority().is_none() || uri.scheme().is_none() {
-//                 return Err(Status::new(Code::InvalidArgument, "invalid uri"));
-//             }
-//             uris.push(uri);
-//         }
-
-//         if uris.is_empty() {
-//             return Err(Status::new(Code::InvalidArgument, "invalid target"));
-//         }
-
-//         let https = HttpsConnectorBuilder::new()
-//             .with_native_roots()
-//             .https_or_http()
-//             .enable_http2()
-//             .build();
-
-//         let client = hyper::Client::builder().http2_only(true).build(https);
-
-//         Ok(Channel { client, uris })
-//     }
-
-//     pub async fn call(
-//         &mut self,
-//         method: &str,
-//         mut request: Request<B>,
-//     ) -> Result<Response<Incoming>, Status> {
-//         // load balance select
-//         let i = rand::random::<usize>() % self.uris.len();
-
-//         let uri = self
-//             .uris
-//             .get(i)
-//             .ok_or_else(|| Status::internal("no avaliable target"))?;
-
-//         let uri = Uri::builder()
-//             .scheme(uri.scheme().expect("scheme must not empty").clone())
-//             .authority(uri.authority().expect("authority must not empty").clone())
-//             .path_and_query(method)
-//             .build()
-//             .map_err(|err| Status::new(Code::InvalidArgument, "uri error").with_cause(err))?;
-
-//         *request.uri_mut() = uri;
-
-//         let resp = self.client.request(request).await?;
-
-//         Ok(resp)
-//     }
-// }
+pub type BoxBody = UnsyncBoxBody<Bytes, Status>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectivityState {
@@ -101,23 +117,23 @@ pub enum ConnectivityState {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SubChannel<B> {
-    id: ChannelID,
+pub(crate) struct SubChannel {
+    id: ChannelId,
     addr: SocketAddr,
     credentail: Credential,
     state: Arc<RwLock<ConnectivityState>>,
     state_tx: mpsc::Sender<ConnectivityState>,
-    sender: Option<SendRequest<B>>,
+    sender: Option<SendRequest<BoxBody>>,
 }
 
-impl<B> SubChannel<B> {
+impl SubChannel {
     pub fn new(
         addr: SocketAddr,
         credentail: Credential,
         state_tx: mpsc::Sender<ConnectivityState>,
     ) -> Self {
         SubChannel {
-            id: ChannelID::next_id(),
+            id: ChannelId::next_id(),
             addr,
             credentail,
             state_tx,
@@ -126,7 +142,7 @@ impl<B> SubChannel<B> {
         }
     }
 
-    pub fn get_id(&self) -> ChannelID {
+    pub fn get_id(&self) -> ChannelId {
         self.id
     }
 
@@ -138,16 +154,6 @@ impl<B> SubChannel<B> {
         *self.state.write().await = state;
         self.state_tx.send(state).await;
     }
-}
-
-
-impl<B> SubChannel<B>
-where
-    B: Body + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-
 
     pub async fn connect(&mut self) -> ConnectivityState {
         self.set_state(ConnectivityState::Connecting);
@@ -197,7 +203,7 @@ where
         Ok(())
     }
 
-    async fn tcp_connect(&mut self) -> Result<SendRequest<B>, Status> {
+    async fn tcp_connect(&mut self) -> Result<SendRequest<BoxBody>, Status> {
         let stream = TcpStream::connect(self.addr).await?;
 
         let (sender, conn) = http2::handshake(TokioExec, stream).await?;
@@ -207,8 +213,27 @@ where
         Ok(sender)
     }
 
-    async fn tls_connect(&mut self) -> Result<SendRequest<B>, Status> {
+    async fn tls_connect(&mut self) -> Result<SendRequest<BoxBody>, Status> {
         unimplemented!()
+    }
+
+    async fn request(&mut self, req: Request<BoxBody>) -> Result<Response<Incoming>, Status> {
+        match self.sender {
+            Some(ref sender) => sender.clone().send_request(req).await.map_err(Into::into),
+            None => {
+                return Err(Status::internal("subchannel is not inited"));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChannelId(usize);
+
+impl ChannelId {
+    pub fn next_id() -> ChannelId {
+        let id = AUTO_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ChannelId(id)
     }
 }
 
@@ -218,34 +243,50 @@ pub enum Credential {
     SecureTls, // TODO: support tls
 }
 
-struct ConnectionManager<B> {
+#[derive(Debug)]
+struct ConnectionManager {
+    credentail: Credential,
     state_rx: mpsc::Receiver<ConnectivityState>,
     state_tx: mpsc::Sender<ConnectivityState>,
-    conns: BTreeMap<ChannelID, SubChannel<B>>,
+    conns: BTreeMap<ChannelId, SubChannel>,
+    addrs: Vec<Uri>,
 }
 
-impl<B> ConnectionManager<B>
-    where
-
- {
-    pub fn new() -> Self {
+impl ConnectionManager {
+    pub fn new(addrs: Vec<Uri>, credentail: Credential) -> Self {
         let (state_tx, state_rx) = mpsc::channel(1);
 
         ConnectionManager {
             state_rx,
             state_tx,
+            addrs,
+            credentail,
             conns: BTreeMap::new(),
         }
     }
 
-    pub async fn connect_one(&mut self, addr: SocketAddr) -> Option<ChannelID> {
+    pub async fn connect_one(&self, addr: SocketAddr) -> Result<ChannelId, Status> {
+        let mut sub_channel = SubChannel::new(addr, self.credentail.clone(), self.state_tx.clone());
+        sub_channel.connect().await;
+
+        Ok(sub_channel.id)
+    }
+
+    pub fn get_addrs(&self) -> impl Iterator<Item = &Uri> {
+        self.addrs.iter()
+    }
+
+    pub async fn request_connection(&self) -> Result<&SubChannel, Status> {
         unimplemented!()
     }
 
-    pub(crate) async fn wait_for_state(&mut self, state: ConnectivityState) -> Option<ConnectivityState> {
+    pub(crate) async fn wait_for_state(
+        &mut self,
+        desire: ConnectivityState,
+    ) -> Option<ConnectivityState> {
         loop {
             match self.state_rx.recv().await {
-                Some(s) if s == state => {
+                Some(s) if s == desire => {
                     return Some(s);
                 }
                 Some(s) => {
@@ -259,43 +300,55 @@ impl<B> ConnectionManager<B>
         }
     }
 
-    pub(crate) async fn get_subchannel_state(&self, id: ChannelID) -> Option<ConnectivityState> {
+    pub(crate) async fn get_subchannel_state(&self, id: ChannelId) -> Option<ConnectivityState> {
         match self.conns.get(&id) {
-            Some(ch) => {
-                Some(ch.get_state().await)
-            }
+            Some(ch) => Some(ch.get_state().await),
             None => None,
         }
     }
-
 }
-
 
 #[async_trait::async_trait]
 pub trait LoadBalancer {
-    async fn pick<B>(&mut self, manager: &mut ConnectionManager<B>) -> Result<ChannelID, Status>;
+    async fn pick(&mut self, manager: &mut ConnectionManager) -> Result<ChannelId, Status>;
 }
 
 pub struct PickFirstBalancer {
-    prefer: Option<ChannelID>,
+    prefer: Option<ChannelId>,
 }
 
 impl PickFirstBalancer {
     pub async fn new() -> Self {
         PickFirstBalancer { prefer: None }
     }
+
+    async fn init(&mut self, manager: &mut ConnectionManager) -> Result<ChannelId, Status> {
+        for addr in manager.get_addrs() {
+            for endpoint in Resolver::resolve(addr)? {
+                match manager.connect_one(endpoint).await {
+                    Ok(id) => return Ok(id),
+                    Err(err) => {
+                        // when err, try next
+                        // TODO: add log
+                    }
+                }
+            }
+        }
+
+        Err(Status::internal("connect to address failed"))
+    }
 }
 
 #[async_trait::async_trait]
 impl LoadBalancer for PickFirstBalancer {
-    async fn pick<B>(&mut self, manager: &mut ConnectionManager<B>) -> Result<ChannelID, Status> {
+    async fn pick(&mut self, manager: &mut ConnectionManager) -> Result<ChannelId, Status> {
         match self.prefer {
             Some(id) => {
                 return Ok(id);
             }
             None => {
                 // try connect on one by one
-                unimplemented!()
+                self.init(manager).await
             }
         }
     }
@@ -304,16 +357,33 @@ impl LoadBalancer for PickFirstBalancer {
 struct Resolver;
 
 impl Resolver {
-    fn resolve(addrs: impl Iterator<Item = impl AsRef<str>>) -> Result<Vec<SocketAddr>, Status> {
-        let mut endpoints = Vec::new();
+    fn resolve(addr: &Uri) -> Result<Vec<SocketAddr>, Status> {
+        match addr.host() {
+            Some(host) => {
+                let mut addrs = ToSocketAddrs::to_socket_addrs(host)?;
 
-        for addr in addrs.into_iter() {
-            for ep in ToSocketAddrs::to_socket_addrs(addr.as_ref())? {
-                endpoints.push(ep);
+                let port = match addr.port_u16() {
+                    Some(port) => port,
+                    None => match addr.scheme_str() {
+                        Some("http") => 80,
+                        Some("https") => 443,
+                        None => {
+                            return Err(Status::internal("unknown port in address"));
+                        }
+                    },
+                };
+
+                Ok(addrs
+                    .map(|a| {
+                        a.set_port(port);
+                        a
+                    })
+                    .collect::<Vec<SocketAddr>>())
+            }
+            None => {
+                return Err(Status::internal("invalid host in address"));
             }
         }
-
-        Ok(endpoints)
     }
 }
 
@@ -329,3 +399,75 @@ where
         tokio::task::spawn(fut);
     }
 }
+
+// struct ReqStream {
+//     inner: Box<dyn Stream<Item = Result<Frame<Bytes>, Status>> + Send + 'static + Unpin>,
+// }
+
+// impl Stream for ReqStream {
+//     type Item = Result<Frame<Bytes>, Status>;
+
+//     fn poll_next(
+//         self: Pin<&mut Self>,
+//         cx: &mut std::task::Context<'_>,
+//     ) -> std::task::Poll<Option<Self::Item>> {
+//         Pin::new(&mut self.get_mut().inner).poll_next(cx)
+//     }
+
+//     fn size_hint(&self) -> (usize, Option<usize>) {
+//         self.inner.size_hint()
+//     }
+// }
+
+// impl Body for ReqStream {
+//     type Data = Bytes;
+//     type Error = Status;
+
+//     fn poll_frame(
+//         self: Pin<&mut Self>,
+//         cx: &mut std::task::Context<'_>,
+//     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+//         Pin::new(&mut self.inner).poll_next(cx)
+//     }
+// }
+
+// enum ReqBody {
+//     Unary(Full<Bytes>),
+//     Stream(StreamBody<Box<dyn Stream<Item = Result<Frame<Bytes>, Status>>>>),
+// }
+
+// impl Body for ReqBody {
+//     type Data = Bytes;
+//     type Error = Status;
+
+//     fn poll_frame(
+//         self: std::pin::Pin<&mut Self>,
+//         cx: &mut std::task::Context<'_>,
+//     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+//         match self.get_mut() {
+//             ReqBody::Unary(frame) => Pin::new(frame).poll_frame(cx).map_err(Into::into),
+
+//             ReqBody::Stream(stream) => Pin::new(stream).poll_frame(cx),
+//         }
+//     }
+// }
+
+// enum ReqBody {
+//     Unary(Full<Bytes>),
+//     Stream(ReqStream),
+// }
+
+// impl Body for ReqBody {
+//     type Data = Bytes;
+//     type Error = Status;
+
+//     fn poll_frame(
+//         self: std::pin::Pin<&mut Self>,
+//         cx: &mut std::task::Context<'_>,
+//     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+//         match self.get_mut() {
+//             ReqBody::Unary(frame) => Pin::new(frame).poll_frame(cx).map_err(Into::into),
+//             ReqBody::Stream(stream) => Pin::new(stream).poll_frame(cx),
+//         }
+//     }
+// }
