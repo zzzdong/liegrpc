@@ -1,6 +1,6 @@
 use std::{pin::Pin, task::Poll};
 
-use bytes::BytesMut;
+use bytes::{BytesMut, Bytes};
 use futures::{Stream, StreamExt};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
@@ -12,7 +12,7 @@ use hyper::{
 use crate::{
     codec::{Decoder, Encoder, ProstDecoder, ProstEncoder},
     metadata::MetadataMap,
-    status::Status,
+    status::Status, channel::BoxBody,
 };
 
 pub mod headers {
@@ -56,7 +56,7 @@ impl<T: Clone> Clone for Request<T> {
 }
 
 impl<T: prost::Message> Request<T> {
-    pub fn into_unary(self) -> Result<hyper::Request<impl Body + 'static>, Status> {
+    pub fn into_unary(self) -> Result<hyper::Request<BoxBody>, Status> {
         let Request { message, metadata } = self;
 
         let encoder = ProstEncoder::new();
@@ -73,7 +73,7 @@ where
     S: Stream<Item = M> + Send + 'static,
     M: prost::Message,
 {
-    pub fn into_stream(self) -> hyper::Request<impl Body + 'static> {
+    pub fn into_stream(self) -> hyper::Request<BoxBody> {
         let Request { metadata, message } = self;
 
         let s = message.map(|m| ProstEncoder::new().encode(&m).map(|b| Frame::data(b)));
@@ -86,8 +86,8 @@ where
 
 fn into_http_request(
     metadata: MetadataMap,
-    body: impl Body + 'static,
-) -> hyper::Request<impl Body + 'static> {
+    body: impl Body<Data = Bytes, Error = Status> + Send + 'static,
+) -> hyper::Request<BoxBody> {
     let mut builder = hyper::Request::builder()
         .version(hyper::Version::HTTP_2)
         .method(hyper::Method::POST)
@@ -102,7 +102,7 @@ fn into_http_request(
         }
     }
 
-    builder.body(body).unwrap()
+    builder.body(BoxBody::new(body)).unwrap()
 }
 
 pub struct Response<T> {

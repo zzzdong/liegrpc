@@ -19,6 +19,7 @@ hyper-util = { git = "https://github.com/hyperium/hyper-util.git" }
 # hyper-rustls = { version="0.23", features=["native-tokio", "http2", "tls12", "logging"] }
 prost = "0.11"
 rand = "0.8"
+tracing = "0.1"
 
 [dev-dependencies]
 tokio-stream = "0.1.11"

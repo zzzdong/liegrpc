@@ -67,7 +67,7 @@ impl GrpcClient for Client {
         request: Request<M1>,
     ) -> Result<Response<M2>, Status>
     where
-        M1: prost::Message,
+        M1: prost::Message + Send,
         M2: prost::Message + Default + 'static,
     {
         let req = request.into_unary()?;
