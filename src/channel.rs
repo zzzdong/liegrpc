@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::Stream;
+use futures::stream::Concat;
 use http_body::Frame;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{Full, StreamBody};
@@ -21,9 +22,7 @@ pub type BoxBody = UnsyncBoxBody<Bytes, Status>;
 
 #[derive(Clone)]
 pub struct Channel {
-    opts: Opts,
-    conns: Arc<Mutex<BTreeMap<ChannelId, SubChannel>>>,
-    load_balancer: Arc<Mutex<Box<dyn LoadBalancer + Send>>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl Channel {
@@ -50,26 +49,50 @@ impl Channel {
             credentail: Credential::InSecure,
         };
 
-        let conns = Arc::new(Mutex::new(BTreeMap::new()));
+
+
+        let inner = Inner {
+            opts,
+            conns: BTreeMap::new(),
+            // load_balancer: Box::new(PickFirstBalancer::new()),
+        };
 
         Ok(Channel {
-            opts,
-            conns,
-            load_balancer: Arc::new(Mutex::new(Box::new(PickFirstBalancer::new()))),
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 
-    pub fn opts(&self) -> Opts {
-        self.opts
+
+    pub async fn call(&mut self, path: &str, req: Request<BoxBody>) -> Result<Response<Incoming>, Status> {
+        let mut conn = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.request_connection().await?.clone()
+        };
+        conn.request(req).await
     }
+
+}
+
+
+struct Inner {
+    opts: Opts,
+    conns: BTreeMap<ChannelId, SubChannel>,
+    // load_balancer: Box<dyn LoadBalancer + Send>,
+}
+
+impl Inner {
+    fn get_opts(&self) -> &Opts {
+        &self.opts
+    }
+
+
 
     pub async fn connect_endpoint(&mut self, endpoint: Endpoint) -> Result<ChannelId, Status> {
         let mut sub_channel = SubChannel::new(endpoint);
         let state = sub_channel.connect().await;
         if state == ConnectivityState::Ready {
-            let mut conns = self.conns.lock().unwrap();
             let id = sub_channel.get_id();
-            conns.insert(id.clone(), sub_channel);
+            self.conns.insert(id.clone(), sub_channel);
             Ok(id)
         } else {
             Err(Status::internal("connect endpoint failed"))
@@ -77,30 +100,44 @@ impl Channel {
     }
 
     async fn request_connection(&mut self) -> Result<Connection, Status> {
-        let channel_id = {
-            let load_balancer = self.load_balancer.clone();
-            let mut load_balancer = load_balancer.lock().unwrap();
-            load_balancer.pick(self).await?;
-        };
-
-        let mut conns = self.conns.lock().unwrap();
-        // let conn = conns.get_mut(&channel_id);
-        let conn = conns.get_mut(&ChannelId(1));
-        
-        if let Some(conn) = conn {
-            let conn = conn.request_connection().await?;
+        if let Some(mut entry) = self.conns.first_entry() {
+            let conn = entry.get_mut().request_connection().await?;
             return Ok(conn);
         } else {
             return Err(Status::internal("can not request connection"));
         }
     }
 
-    pub async fn call(&mut self, path: &str, req: Request<BoxBody>) -> Result<Response<Incoming>, Status> {
-        let mut conn = self.request_connection().await?;
-        conn.request(req).await
+    async fn connect_one(&mut self) -> Result<ChannelId, Status> {
+        for addr in &self.get_opts().addrs.clone() {
+            for ep in Resolver::resolve(addr)? {
+                let endpoint = Endpoint { addr: ep, credentail: self.get_opts().credentail.clone() };
+                let mut  conn = SubChannel::new(endpoint);
+                if ConnectivityState::Ready == conn.connect().await {
+                    let id = conn.get_id();
+                    self.conns.insert(id.clone(), conn);
+                    return Ok(id);
+                }
+            }
+        }
+
+        Err(Status::internal("can not connect"))
     }
 
+
+    async fn connect_and_wait_one(&mut self) -> Result<(), Status> {
+        for addr in &self.get_opts().addrs.clone() {
+            for ep in Resolver::resolve(addr)? {
+                let endpoint = Endpoint { addr: ep, credentail: self.get_opts().credentail.clone() };
+                let conn = SubChannel::new(endpoint);
+                self.conns.insert(conn.get_id().clone(), conn);
+            }
+        }
+
+        Ok(())
+    }
 }
+
 
 #[derive(Clone)]
 struct Opts {
@@ -127,8 +164,6 @@ impl Connection {
         }
     }
 }
-
-unsafe impl Send for Connection {}
 
 #[derive(Debug, Clone)]
 struct Endpoint {
@@ -269,53 +304,53 @@ pub enum Credential {
     SecureTls, // TODO: support tls
 }
 
-#[async_trait::async_trait]
-pub trait LoadBalancer {
-    async fn pick(&mut self, channel: &mut Channel) -> Result<ChannelId, Status>;
-}
+// #[async_trait::async_trait]
+// trait LoadBalancer {
+//     async fn pick(&mut self, channel: &mut Inner) -> Result<ChannelId, Status>;
+// }
 
-pub struct PickFirstBalancer {
-    prefer: Option<ChannelId>,
-}
+// struct PickFirstBalancer {
+//     prefer: Option<ChannelId>,
+// }
 
-impl PickFirstBalancer {
-    pub fn new() -> Self {
-        PickFirstBalancer { prefer: None }
-    }
+// impl PickFirstBalancer {
+//     pub fn new() -> Self {
+//         PickFirstBalancer { prefer: None }
+//     }
 
-    async fn init(&mut self, channel: &mut Channel) -> Result<ChannelId, Status> {
-        Err(Status::internal("connect to address failed"))
-    }
-}
+//     async fn init(&mut self, channel: &mut Inner) -> Result<ChannelId, Status> {
+//         Err(Status::internal("connect to address failed"))
+//     }
+// }
 
-#[async_trait::async_trait]
-impl LoadBalancer for PickFirstBalancer {
-    async fn pick(&mut self, channel: &mut Channel) -> Result<ChannelId, Status> {
-        match self.prefer {
-            Some(id) => {
-                return Ok(id);
-            }
-            None => {
-                // try connect on one by one
-                for addr in &channel.opts().addrs {
-                    for ep in Resolver::resolve(addr)? {
-                        let endpoint = Endpoint { addr: ep, credentail: channel.opts().credentail.clone() };
-                        match channel.connect_endpoint(endpoint).await {
-                            Ok(id) => {
-                                return Ok(id);
-                            }
-                            Err(err) => {
-                                // let it go
-                            }
-                        }
-                    }
-                }
+// #[async_trait::async_trait]
+// impl LoadBalancer for PickFirstBalancer {
+//     async fn pick(&mut self, channel: &mut Inner) -> Result<ChannelId, Status> {
+//         match self.prefer {
+//             Some(id) => {
+//                 return Ok(id);
+//             }
+//             None => {
+//                 // try connect on one by one
+//                 for addr in &channel.get_opts().addrs {
+//                     for ep in Resolver::resolve(addr)? {
+//                         let endpoint = Endpoint { addr: ep, credentail: channel.get_opts().credentail.clone() };
+//                         match channel.connect_endpoint(endpoint).await {
+//                             Ok(id) => {
+//                                 return Ok(id);
+//                             }
+//                             Err(err) => {
+//                                 // let it go
+//                             }
+//                         }
+//                     }
+//                 }
 
-                return Err(Status::internal("con not pick connection"));
-            }
-        }
-    }
-}
+//                 return Err(Status::internal("con not pick connection"));
+//             }
+//         }
+//     }
+// }
 
 struct Resolver;
 
