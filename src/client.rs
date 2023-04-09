@@ -70,9 +70,9 @@ impl GrpcClient for Client {
         M1: prost::Message + Send,
         M2: prost::Message + Default + 'static,
     {
-        let req = request.into_unary()?;
+        let req = request.into_unary(path)?;
 
-        let resp = self.channel.call(path, req).await?;
+        let resp = self.channel.call(req).await?;
 
         Response::new_unary(resp).await
     }
@@ -86,9 +86,9 @@ impl GrpcClient for Client {
         M1: prost::Message,
         M2: prost::Message + Default + 'static,
     {
-        let req = request.into_unary()?;
+        let req = request.into_unary(path)?;
 
-        let resp = self.channel.call(path, req).await?;
+        let resp = self.channel.call(req).await?;
 
         Response::new_streaming(resp).await
     }
@@ -103,9 +103,9 @@ impl GrpcClient for Client {
         M1: prost::Message,
         M2: prost::Message + Default + 'static,
     {
-        let req = request.into_stream();
+        let req = request.into_stream(path);
 
-        let resp = self.channel.call(path, req).await?;
+        let resp = self.channel.call(req).await?;
 
         Response::new_unary(resp).await
     }
@@ -120,9 +120,9 @@ impl GrpcClient for Client {
         M1: prost::Message,
         M2: prost::Message + Default + 'static,
     {
-        let req = request.into_stream();
+        let req = request.into_stream(path);
 
-        let resp = self.channel.call(path, req).await?;
+        let resp = self.channel.call(req).await?;
 
         Response::new_streaming(resp).await
     }

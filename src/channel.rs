@@ -2,23 +2,31 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 
 use bytes::Bytes;
 use futures::Stream;
 use futures::stream::Concat;
 use http_body::Frame;
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{Full, StreamBody};
+use http_body_util::{Full, StreamBody, BodyExt};
 use hyper::body::Incoming;
 use hyper::client::conn::http2::{self, handshake, Builder, SendRequest};
 use hyper::{body::Body, Request, Response, Uri};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 use crate::status::{self, Code, Status};
 
 pub type BoxBody = UnsyncBoxBody<Bytes, Status>;
+
+pub(crate) fn boxed<B>(body: B) -> BoxBody
+where
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<crate::Status>,
+{
+    body.map_err(|err|err.into()).boxed_unsync()
+}
 
 #[derive(Clone)]
 pub struct Channel {
@@ -45,11 +53,9 @@ impl Channel {
         }
 
         let opts = Opts {
-            addrs: uris,
+            uris,
             credentail: Credential::InSecure,
         };
-
-
 
         let inner = Inner {
             opts,
@@ -63,9 +69,9 @@ impl Channel {
     }
 
 
-    pub async fn call(&mut self, path: &str, req: Request<BoxBody>) -> Result<Response<Incoming>, Status> {
+    pub async fn call(&mut self, req: Request<BoxBody>) -> Result<Response<Incoming>, Status> {
         let mut conn = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().await;
             inner.request_connection().await?.clone()
         };
         conn.request(req).await
@@ -85,8 +91,6 @@ impl Inner {
         &self.opts
     }
 
-
-
     pub async fn connect_endpoint(&mut self, endpoint: Endpoint) -> Result<ChannelId, Status> {
         let mut sub_channel = SubChannel::new(endpoint);
         let state = sub_channel.connect().await;
@@ -104,31 +108,38 @@ impl Inner {
             let conn = entry.get_mut().request_connection().await?;
             return Ok(conn);
         } else {
-            return Err(Status::internal("can not request connection"));
+            match self.connect_one().await {
+                Ok(conn) => {
+                    Ok(conn)
+                }
+                Err(err) => {
+                    Err(Status::internal("can not request connection"))
+                }
+            }
         }
     }
 
-    async fn connect_one(&mut self) -> Result<ChannelId, Status> {
-        for addr in &self.get_opts().addrs.clone() {
-            for ep in Resolver::resolve(addr)? {
-                let endpoint = Endpoint { addr: ep, credentail: self.get_opts().credentail.clone() };
+    async fn connect_one(&mut self) -> Result<Connection, Status> {
+        for uri in &self.get_opts().uris.clone() {
+            for ep in Resolver::resolve(uri)? {
+                let endpoint = Endpoint { uri: uri.clone(), addr: ep, credentail: self.get_opts().credentail.clone() };
                 let mut  conn = SubChannel::new(endpoint);
-                if ConnectivityState::Ready == conn.connect().await {
+                if let Ok(c) = conn.request_connection().await {
                     let id = conn.get_id();
                     self.conns.insert(id.clone(), conn);
-                    return Ok(id);
+                    return Ok(c);
                 }
             }
         }
 
-        Err(Status::internal("can not connect"))
+        Err(Status::internal("can not connect one"))
     }
 
 
     async fn connect_and_wait_one(&mut self) -> Result<(), Status> {
-        for addr in &self.get_opts().addrs.clone() {
-            for ep in Resolver::resolve(addr)? {
-                let endpoint = Endpoint { addr: ep, credentail: self.get_opts().credentail.clone() };
+        for uri in &self.get_opts().uris.clone() {
+            for ep in Resolver::resolve(uri)? {
+                let endpoint = Endpoint { uri: uri.clone(), addr: ep, credentail: self.get_opts().credentail.clone() };
                 let conn = SubChannel::new(endpoint);
                 self.conns.insert(conn.get_id().clone(), conn);
             }
@@ -141,19 +152,25 @@ impl Inner {
 
 #[derive(Clone)]
 struct Opts {
-    addrs: Vec<Uri>,
+    uris: Vec<Uri>,
     credentail: Credential,
 }
 
 #[derive(Clone)]
-struct Connection {
+pub struct Connection {
     id: ChannelId,
+    uri: Uri,
     transport: SendRequest<BoxBody>,
     state: Arc<RwLock<ConnectivityState>>,
 }
 
 impl Connection {
-    pub async fn request(&mut self, req: Request<BoxBody>) -> Result<Response<Incoming>, Status> {
+    pub async fn request(mut self, req: Request<BoxBody>) -> Result<Response<Incoming>, Status> {
+        let mut req = req;
+        let mut parts = self.uri.into_parts();
+        parts.path_and_query = req.uri().path_and_query().cloned();
+
+        *req.uri_mut() = Uri::from_parts(parts).unwrap();
         match self.transport.send_request(req).await {
             Ok(resp) => Ok(resp),
             Err(err) => {
@@ -166,7 +183,8 @@ impl Connection {
 }
 
 #[derive(Debug, Clone)]
-struct Endpoint {
+pub struct Endpoint {
+    uri: Uri,
     addr: SocketAddr,
     credentail: Credential,
 }
@@ -211,18 +229,19 @@ impl SubChannel {
     }
 
     pub async fn connect(&mut self) -> ConnectivityState {
-        if let Some(ref transport) =  self.transport {
+        if self.transport.is_some() {
             return self.get_state().await;
         }
 
-        self.set_state(ConnectivityState::Connecting);
+        self.set_state(ConnectivityState::Connecting).await;
 
         match self.inner_connect().await {
             Ok(_) => {
-                self.set_state(ConnectivityState::Ready);
+                self.set_state(ConnectivityState::Ready).await;
             }
             Err(err) => {
-                self.set_state(ConnectivityState::TransientFailure);
+                println!("connect {:?} failed, {:?}", self.endpoint, err);
+                self.set_state(ConnectivityState::TransientFailure).await;
             }
         };
 
@@ -234,7 +253,17 @@ impl SubChannel {
 
         loop {
             match self.get_state().await {
-                ConnectivityState::Connecting | ConnectivityState::Ready => {
+                ConnectivityState::Ready => {
+                    let conn = self.transport.clone().expect("transport must ok when ready");
+                        let conn = Connection {
+                            id: self.id.clone(),
+                            uri: self.endpoint.uri.clone(),
+                            state: self.state.clone(),
+                            transport: conn.clone(),
+                        };
+                        return Ok(conn);
+                }
+                ConnectivityState::Connecting => {
                     // let it go
                 }
                 ConnectivityState::Shutdown => {
@@ -246,6 +275,7 @@ impl SubChannel {
                         let conn = self.transport.clone().expect("transport must ok when ready");
                         let conn = Connection {
                             id: self.id.clone(),
+                            uri: self.endpoint.uri.clone(),
                             state: self.state.clone(),
                             transport: conn.clone(),
                         };
@@ -358,21 +388,21 @@ impl Resolver {
     fn resolve(addr: &Uri) -> Result<Vec<SocketAddr>, Status> {
         match addr.host() {
             Some(host) => {
-                let mut addrs = ToSocketAddrs::to_socket_addrs(host)?;
+                let addrs = ToSocketAddrs::to_socket_addrs(&(host, 0))?;
 
                 let port = match addr.port_u16() {
                     Some(port) => port,
                     None => match addr.scheme_str() {
                         Some("http") => 80,
                         Some("https") => 443,
-                        None => {
+                        _ => {
                             return Err(Status::internal("unknown port in address"));
                         }
                     },
                 };
 
                 Ok(addrs
-                    .map(|a| {
+                    .map(|mut a| {
                         a.set_port(port);
                         a
                     })

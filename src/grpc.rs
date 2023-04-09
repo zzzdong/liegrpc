@@ -6,13 +6,13 @@ use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::{
     body::{Body, Incoming},
-    HeaderMap,
+    HeaderMap, Uri,
 };
 
 use crate::{
     codec::{Decoder, Encoder, ProstDecoder, ProstEncoder},
     metadata::MetadataMap,
-    status::Status, channel::BoxBody,
+    status::Status, channel::{BoxBody, boxed},
 };
 
 pub mod headers {
@@ -56,7 +56,7 @@ impl<T: Clone> Clone for Request<T> {
 }
 
 impl<T: prost::Message> Request<T> {
-    pub fn into_unary(self) -> Result<hyper::Request<BoxBody>, Status> {
+    pub fn into_unary(self, path: &str) -> Result<hyper::Request<BoxBody>, Status> {
         let Request { message, metadata } = self;
 
         let encoder = ProstEncoder::new();
@@ -64,7 +64,7 @@ impl<T: prost::Message> Request<T> {
         let buf = encoder.encode(&message)?;
         let payload = http_body_util::Full::new(buf);
 
-        Ok(into_http_request(metadata, payload))
+        Ok(into_http_request(path, metadata, boxed(payload)))
     }
 }
 
@@ -73,24 +73,26 @@ where
     S: Stream<Item = M> + Send + 'static,
     M: prost::Message,
 {
-    pub fn into_stream(self) -> hyper::Request<BoxBody> {
+    pub fn into_stream(self, path: &str) -> hyper::Request<BoxBody> {
         let Request { metadata, message } = self;
 
         let s = message.map(|m| ProstEncoder::new().encode(&m).map(|b| Frame::data(b)));
 
         let payload = StreamBody::new(s);
 
-        into_http_request(metadata, payload)
+        into_http_request(path, metadata, payload)
     }
 }
 
 fn into_http_request(
+    path: &str,
     metadata: MetadataMap,
     body: impl Body<Data = Bytes, Error = Status> + Send + 'static,
 ) -> hyper::Request<BoxBody> {
     let mut builder = hyper::Request::builder()
         .version(hyper::Version::HTTP_2)
         .method(hyper::Method::POST)
+        .uri(Uri::try_from(path).unwrap())
         .header(
             hyper::http::header::CONTENT_TYPE,
             headers::APPLICATION_GRPC_PROTO,
