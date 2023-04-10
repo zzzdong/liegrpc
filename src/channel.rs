@@ -1,22 +1,21 @@
+use std::cmp::min;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use futures::Stream;
-use futures::stream::Concat;
-use http_body::Frame;
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{Full, StreamBody, BodyExt};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::client::conn::http2::{self, handshake, Builder, SendRequest};
-use hyper::{body::Body, Request, Response, Uri};
+use hyper::client::conn::http2::{handshake, SendRequest};
+use hyper::{Request, Response, Uri};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::Instant;
 
-use crate::status::{self, Code, Status};
+use crate::status::{Code, Status};
 
 pub type BoxBody = UnsyncBoxBody<Bytes, Status>;
 
@@ -25,12 +24,13 @@ where
     B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
     B::Error: Into<crate::Status>,
 {
-    body.map_err(|err|err.into()).boxed_unsync()
+    body.map_err(|err| err.into()).boxed_unsync()
 }
 
 #[derive(Clone)]
 pub struct Channel {
     inner: Arc<Mutex<Inner>>,
+    load_balancer: Arc<Mutex<Box<dyn LoadBalancer + Send + Sync>>>,
 }
 
 impl Channel {
@@ -57,36 +57,47 @@ impl Channel {
             credentail: Credential::InSecure,
         };
 
-        let inner = Inner {
-            opts,
-            conns: BTreeMap::new(),
-            // load_balancer: Box::new(PickFirstBalancer::new()),
-        };
+        let inner = Inner::new(opts);
 
         Ok(Channel {
             inner: Arc::new(Mutex::new(inner)),
+            load_balancer: Arc::new(Mutex::new(Box::new(PickFirstBalancer::new()))),
         })
     }
 
-
     pub async fn call(&mut self, req: Request<BoxBody>) -> Result<Response<Incoming>, Status> {
-        let mut conn = {
-            let mut inner = self.inner.lock().await;
-            inner.request_connection().await?.clone()
-        };
+        let mut inner = self.inner.lock().await;
+
+        let mut load_balancer = self.load_balancer.lock().await;
+
+        let id = load_balancer.pick(&mut inner).await?;
+
+        let conn = inner.make_connection(id).await?;
+
         conn.request(req).await
     }
-
 }
-
 
 struct Inner {
     opts: Opts,
     conns: BTreeMap<ChannelId, SubChannel>,
-    // load_balancer: Box<dyn LoadBalancer + Send>,
 }
 
 impl Inner {
+    fn new(opts: Opts) -> Self {
+        Inner {
+            opts,
+            conns: BTreeMap::new(),
+        }
+    }
+
+    async fn make_connection(&mut self, id: ChannelId) -> Result<Connection, Status> {
+        match self.conns.get_mut(&id) {
+            Some(channel) => channel.make_connection().await,
+            None => Err(Status::internal("can not request connection")),
+        }
+    }
+
     fn get_opts(&self) -> &Opts {
         &self.opts
     }
@@ -96,59 +107,26 @@ impl Inner {
         let state = sub_channel.connect().await;
         if state == ConnectivityState::Ready {
             let id = sub_channel.get_id();
-            self.conns.insert(id.clone(), sub_channel);
+            self.conns.insert(id, sub_channel);
             Ok(id)
         } else {
             Err(Status::internal("connect endpoint failed"))
         }
     }
 
-    async fn request_connection(&mut self) -> Result<Connection, Status> {
-        if let Some(mut entry) = self.conns.first_entry() {
-            let conn = entry.get_mut().request_connection().await?;
-            return Ok(conn);
-        } else {
-            match self.connect_one().await {
-                Ok(conn) => {
-                    Ok(conn)
-                }
-                Err(err) => {
-                    Err(Status::internal("can not request connection"))
-                }
-            }
-        }
-    }
+    pub fn resolve_addrs(&self) -> Result<Vec<Endpoint>, Status> {
+        let mut endpoints = Vec::new();
 
-    async fn connect_one(&mut self) -> Result<Connection, Status> {
         for uri in &self.get_opts().uris.clone() {
-            for ep in Resolver::resolve(uri)? {
-                let endpoint = Endpoint { uri: uri.clone(), addr: ep, credentail: self.get_opts().credentail.clone() };
-                let mut  conn = SubChannel::new(endpoint);
-                if let Ok(c) = conn.request_connection().await {
-                    let id = conn.get_id();
-                    self.conns.insert(id.clone(), conn);
-                    return Ok(c);
-                }
+            for addr in Resolver::resolve(uri)? {
+                let endpoint = Endpoint::new(uri.clone(), addr, self.get_opts().credentail.clone());
+                endpoints.push(endpoint);
             }
         }
 
-        Err(Status::internal("can not connect one"))
-    }
-
-
-    async fn connect_and_wait_one(&mut self) -> Result<(), Status> {
-        for uri in &self.get_opts().uris.clone() {
-            for ep in Resolver::resolve(uri)? {
-                let endpoint = Endpoint { uri: uri.clone(), addr: ep, credentail: self.get_opts().credentail.clone() };
-                let conn = SubChannel::new(endpoint);
-                self.conns.insert(conn.get_id().clone(), conn);
-            }
-        }
-
-        Ok(())
+        Ok(endpoints)
     }
 }
-
 
 #[derive(Clone)]
 struct Opts {
@@ -165,6 +143,20 @@ pub struct Connection {
 }
 
 impl Connection {
+    pub fn new(
+        id: ChannelId,
+        uri: Uri,
+        state: Arc<RwLock<ConnectivityState>>,
+        transport: SendRequest<BoxBody>,
+    ) -> Self {
+        Connection {
+            id,
+            uri,
+            state,
+            transport,
+        }
+    }
+
     pub async fn request(mut self, req: Request<BoxBody>) -> Result<Response<Incoming>, Status> {
         let mut req = req;
         let mut parts = self.uri.into_parts();
@@ -172,8 +164,12 @@ impl Connection {
 
         *req.uri_mut() = Uri::from_parts(parts).unwrap();
         match self.transport.send_request(req).await {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                tracing::debug!(id=?self.id, "http2 request done");
+                Ok(resp)
+            }
             Err(err) => {
+                tracing::error!(?err, id=?self.id, "http2 request failed");
                 let mut state = self.state.write().await;
                 *state = ConnectivityState::TransientFailure;
                 Err(err.into())
@@ -186,7 +182,17 @@ impl Connection {
 pub struct Endpoint {
     uri: Uri,
     addr: SocketAddr,
-    credentail: Credential,
+    credential: Credential,
+}
+
+impl Endpoint {
+    fn new(uri: Uri, addr: SocketAddr, credential: Credential) -> Self {
+        Endpoint {
+            uri,
+            addr,
+            credential,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,20 +254,23 @@ impl SubChannel {
         self.get_state().await
     }
 
-    pub async fn request_connection(&mut self) -> Result<Connection, Status> {
+    pub async fn make_connection(&mut self) -> Result<Connection, Status> {
         let mut retry = 0;
 
         loop {
             match self.get_state().await {
                 ConnectivityState::Ready => {
-                    let conn = self.transport.clone().expect("transport must ok when ready");
-                        let conn = Connection {
-                            id: self.id.clone(),
-                            uri: self.endpoint.uri.clone(),
-                            state: self.state.clone(),
-                            transport: conn.clone(),
-                        };
-                        return Ok(conn);
+                    let transport = self
+                        .transport
+                        .clone()
+                        .expect("transport must ok when ready");
+                    let conn = Connection {
+                        id: self.id.clone(),
+                        uri: self.endpoint.uri.clone(),
+                        state: self.state.clone(),
+                        transport,
+                    };
+                    return Ok(conn);
                 }
                 ConnectivityState::Connecting => {
                     // let it go
@@ -272,13 +281,16 @@ impl SubChannel {
                 _ => {
                     let state = self.connect().await;
                     if state == ConnectivityState::Ready {
-                        let conn = self.transport.clone().expect("transport must ok when ready");
-                        let conn = Connection {
-                            id: self.id.clone(),
-                            uri: self.endpoint.uri.clone(),
-                            state: self.state.clone(),
-                            transport: conn.clone(),
-                        };
+                        let transport = self
+                            .transport
+                            .clone()
+                            .expect("transport must ok when ready");
+                        let conn = Connection::new(
+                            self.id.clone(),
+                            self.endpoint.uri.clone(),
+                            self.state.clone(),
+                            transport,
+                        );
                         return Ok(conn);
                     }
                 }
@@ -292,7 +304,7 @@ impl SubChannel {
     }
 
     async fn inner_connect(&mut self) -> Result<(), Status> {
-        self.transport = match self.endpoint.credentail {
+        self.transport = match self.endpoint.credential {
             Credential::InSecure => self.tcp_connect().await,
             Credential::SecureTls => self.tls_connect().await,
         }
@@ -304,7 +316,7 @@ impl SubChannel {
     async fn tcp_connect(&mut self) -> Result<SendRequest<BoxBody>, Status> {
         let stream = TcpStream::connect(self.endpoint.addr).await?;
 
-        let (sender, conn) = http2::handshake(TokioExec, stream).await?;
+        let (sender, conn) = handshake(TokioExec, stream).await?;
 
         tokio::task::spawn(async move { conn.await });
 
@@ -334,53 +346,50 @@ pub enum Credential {
     SecureTls, // TODO: support tls
 }
 
-// #[async_trait::async_trait]
-// trait LoadBalancer {
-//     async fn pick(&mut self, channel: &mut Inner) -> Result<ChannelId, Status>;
-// }
+#[async_trait::async_trait]
+trait LoadBalancer {
+    async fn pick(&mut self, channel: &mut Inner) -> Result<ChannelId, Status>;
+}
 
-// struct PickFirstBalancer {
-//     prefer: Option<ChannelId>,
-// }
+struct PickFirstBalancer {
+    prefer: Option<ChannelId>,
+}
 
-// impl PickFirstBalancer {
-//     pub fn new() -> Self {
-//         PickFirstBalancer { prefer: None }
-//     }
+impl PickFirstBalancer {
+    pub fn new() -> Self {
+        PickFirstBalancer { prefer: None }
+    }
+}
 
-//     async fn init(&mut self, channel: &mut Inner) -> Result<ChannelId, Status> {
-//         Err(Status::internal("connect to address failed"))
-//     }
-// }
+#[async_trait::async_trait]
+impl LoadBalancer for PickFirstBalancer {
+    async fn pick(&mut self, channel: &mut Inner) -> Result<ChannelId, Status> {
+        match self.prefer {
+            Some(id) => {
+                return Ok(id);
+            }
+            None => {
+                // try connect on one by one
+                let endpoints = channel.resolve_addrs()?;
+                for endpoint in &endpoints {
+                    match channel.connect_endpoint(endpoint.clone()).await {
+                        Ok(id) => {
+                            self.prefer = Some(id);
+                            return Ok(id);
+                        }
+                        Err(err) => {
+                            tracing::trace!(?endpoint, ?err, "connect endpoint failed");
+                        }
+                    }
+                }
 
-// #[async_trait::async_trait]
-// impl LoadBalancer for PickFirstBalancer {
-//     async fn pick(&mut self, channel: &mut Inner) -> Result<ChannelId, Status> {
-//         match self.prefer {
-//             Some(id) => {
-//                 return Ok(id);
-//             }
-//             None => {
-//                 // try connect on one by one
-//                 for addr in &channel.get_opts().addrs {
-//                     for ep in Resolver::resolve(addr)? {
-//                         let endpoint = Endpoint { addr: ep, credentail: channel.get_opts().credentail.clone() };
-//                         match channel.connect_endpoint(endpoint).await {
-//                             Ok(id) => {
-//                                 return Ok(id);
-//                             }
-//                             Err(err) => {
-//                                 // let it go
-//                             }
-//                         }
-//                     }
-//                 }
+                tracing::error!(?endpoints, "all endpoints were failed to connected!");
 
-//                 return Err(Status::internal("con not pick connection"));
-//             }
-//         }
-//     }
-// }
+                return Err(Status::internal("can not pick connection"));
+            }
+        }
+    }
+}
 
 struct Resolver;
 
@@ -415,6 +424,32 @@ impl Resolver {
     }
 }
 
+const INITIAL_BACKOFF: f32 = 1.0;
+const MAX_BACKOFF: f32 = 120.0;
+const JITTER: f32 = 0.2;
+
+struct Backoff {
+    backoff: f32,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Backoff { backoff: INITIAL_BACKOFF }
+    }
+
+    fn deadline(&self) -> Instant {
+        let backoff = self.backoff;
+        Instant::now().checked_add(Duration::from_secs_f32(backoff)).unwrap()
+    }
+
+    fn next(&mut self) {
+       self.backoff = f32::min(1.6 * self.backoff, MAX_BACKOFF);
+    }
+
+
+}
+
+
 #[derive(Clone, Copy, Debug)]
 struct TokioExec;
 
@@ -427,75 +462,3 @@ where
         tokio::task::spawn(fut);
     }
 }
-
-// struct ReqStream {
-//     inner: Box<dyn Stream<Item = Result<Frame<Bytes>, Status>> + Send + 'static + Unpin>,
-// }
-
-// impl Stream for ReqStream {
-//     type Item = Result<Frame<Bytes>, Status>;
-
-//     fn poll_next(
-//         self: Pin<&mut Self>,
-//         cx: &mut std::task::Context<'_>,
-//     ) -> std::task::Poll<Option<Self::Item>> {
-//         Pin::new(&mut self.get_mut().inner).poll_next(cx)
-//     }
-
-//     fn size_hint(&self) -> (usize, Option<usize>) {
-//         self.inner.size_hint()
-//     }
-// }
-
-// impl Body for ReqStream {
-//     type Data = Bytes;
-//     type Error = Status;
-
-//     fn poll_frame(
-//         self: Pin<&mut Self>,
-//         cx: &mut std::task::Context<'_>,
-//     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-//         Pin::new(&mut self.inner).poll_next(cx)
-//     }
-// }
-
-// enum ReqBody {
-//     Unary(Full<Bytes>),
-//     Stream(StreamBody<Box<dyn Stream<Item = Result<Frame<Bytes>, Status>>>>),
-// }
-
-// impl Body for ReqBody {
-//     type Data = Bytes;
-//     type Error = Status;
-
-//     fn poll_frame(
-//         self: std::pin::Pin<&mut Self>,
-//         cx: &mut std::task::Context<'_>,
-//     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-//         match self.get_mut() {
-//             ReqBody::Unary(frame) => Pin::new(frame).poll_frame(cx).map_err(Into::into),
-
-//             ReqBody::Stream(stream) => Pin::new(stream).poll_frame(cx),
-//         }
-//     }
-// }
-
-// enum ReqBody {
-//     Unary(Full<Bytes>),
-//     Stream(ReqStream),
-// }
-
-// impl Body for ReqBody {
-//     type Data = Bytes;
-//     type Error = Status;
-
-//     fn poll_frame(
-//         self: std::pin::Pin<&mut Self>,
-//         cx: &mut std::task::Context<'_>,
-//     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-//         match self.get_mut() {
-//             ReqBody::Unary(frame) => Pin::new(frame).poll_frame(cx).map_err(Into::into),
-//             ReqBody::Stream(stream) => Pin::new(stream).poll_frame(cx),
-//         }
-//     }
-// }

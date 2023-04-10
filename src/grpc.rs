@@ -1,6 +1,6 @@
 use std::{pin::Pin, task::Poll};
 
-use bytes::{BytesMut, Bytes};
+use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
@@ -10,9 +10,10 @@ use hyper::{
 };
 
 use crate::{
+    channel::{boxed, BoxBody},
     codec::{Decoder, Encoder, ProstDecoder, ProstEncoder},
     metadata::MetadataMap,
-    status::Status, channel::{BoxBody, boxed},
+    status::Status,
 };
 
 pub mod headers {
@@ -145,11 +146,14 @@ where
     pub async fn new_unary(resp: hyper::Response<Incoming>) -> Result<Self, Status> {
         let (mut parts, body) = resp.into_parts();
 
-        if parts.status != hyper::StatusCode::OK {
-            let status = Status::from_http_status(parts.status);
-            if !status.is_ok() {
-                return Err(status);
-            }
+        let status = if parts.status != hyper::StatusCode::OK {
+            Status::from_http_status(parts.status)
+        } else {
+            Status::from_header_map(&parts.headers)?
+        };
+
+        if !status.is_ok() {
+            return Err(status);
         }
 
         let mut streaming = Streaming::new(body);
@@ -160,7 +164,7 @@ where
             .ok_or_else(|| Status::internal("expect first message"))?;
 
         // when unary, should wait for trailer
-        let trailers = streaming.recv_trailers().await?;
+        streaming.recv_trailers().await?;
         parts.headers.extend(streaming.take_trailers());
 
         // status from header and trailer.
@@ -187,15 +191,17 @@ where
     pub async fn new_streaming(resp: hyper::Response<Incoming>) -> Result<Self, Status> {
         let (parts, body) = resp.into_parts();
 
-        if parts.status != hyper::StatusCode::OK {
-            let status = Status::from_http_status(parts.status);
-            if !status.is_ok() {
-                return Err(status);
-            }
+        let status = if parts.status != hyper::StatusCode::OK {
+            Status::from_http_status(parts.status)
+        } else {
+            Status::from_header_map(&parts.headers)?
+        };
+
+        if !status.is_ok() {
+            return Err(status);
         }
 
         let mut metadata = MetadataMap::new();
-
         metadata.merge_http_header(&parts.headers);
 
         let streaming = Streaming::new(body);

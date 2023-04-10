@@ -18,6 +18,8 @@ pub struct HelloReply {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let uri = "http://127.0.0.1:50001";
     let mut client = liegrpc::client::Client::new([uri].iter()).unwrap();
 

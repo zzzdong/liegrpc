@@ -1282,6 +1282,8 @@ use liegrpc::{
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let uri = "http://127.0.0.1:2379";
     let mut client = liegrpc::client::Client::new([uri].iter()).unwrap();
 
@@ -1327,6 +1329,4 @@ async fn main() {
     while let Some(m) = message_stream.next().await {
         println!("watch => {:?}", m);
     }
-
-
 }
