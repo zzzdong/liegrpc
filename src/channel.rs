@@ -1,4 +1,3 @@
-use std::cmp::min;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::AtomicUsize;
@@ -11,9 +10,10 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http2::{handshake, SendRequest};
 use hyper::{Request, Response, Uri};
+use rand::{thread_rng, Rng};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, RwLock};
-use tokio::time::Instant;
+use tokio::sync::Mutex;
+use tokio::time::{sleep_until, Instant};
 
 use crate::status::{Code, Status};
 
@@ -139,14 +139,14 @@ pub struct Connection {
     id: ChannelId,
     uri: Uri,
     transport: SendRequest<BoxBody>,
-    state: Arc<RwLock<ConnectivityState>>,
+    state: Arc<Mutex<ConnectivityState>>,
 }
 
 impl Connection {
     pub fn new(
         id: ChannelId,
         uri: Uri,
-        state: Arc<RwLock<ConnectivityState>>,
+        state: Arc<Mutex<ConnectivityState>>,
         transport: SendRequest<BoxBody>,
     ) -> Self {
         Connection {
@@ -170,7 +170,7 @@ impl Connection {
             }
             Err(err) => {
                 tracing::error!(?err, id=?self.id, "http2 request failed");
-                let mut state = self.state.write().await;
+                let mut state = self.state.lock().await;
                 *state = ConnectivityState::TransientFailure;
                 Err(err.into())
             }
@@ -208,7 +208,7 @@ pub enum ConnectivityState {
 pub(crate) struct SubChannel {
     id: ChannelId,
     endpoint: Endpoint,
-    state: Arc<RwLock<ConnectivityState>>,
+    state: Arc<Mutex<ConnectivityState>>,
     transport: Option<SendRequest<BoxBody>>,
 }
 
@@ -217,7 +217,7 @@ impl SubChannel {
         SubChannel {
             id: ChannelId::next_id(),
             endpoint,
-            state: Arc::new(RwLock::new(ConnectivityState::Idle)),
+            state: Arc::new(Mutex::new(ConnectivityState::Idle)),
             transport: None,
         }
     }
@@ -227,38 +227,34 @@ impl SubChannel {
     }
 
     pub async fn get_state(&self) -> ConnectivityState {
-        *self.state.read().await
-    }
-
-    async fn set_state(&mut self, state: ConnectivityState) {
-        *self.state.write().await = state;
+        *self.state.lock().await
     }
 
     pub async fn connect(&mut self) -> ConnectivityState {
-        if self.transport.is_some() {
-            return self.get_state().await;
-        }
-
-        self.set_state(ConnectivityState::Connecting).await;
+        let mut state = self.state.lock().await;
 
         match self.inner_connect().await {
-            Ok(_) => {
-                self.set_state(ConnectivityState::Ready).await;
+            Ok(transport) => {
+                self.transport = transport;
+                *state = ConnectivityState::Ready;
             }
             Err(err) => {
-                println!("connect {:?} failed, {:?}", self.endpoint, err);
-                self.set_state(ConnectivityState::TransientFailure).await;
+                tracing::error!(endpoint=?self.endpoint, ?err, "connect failed");
+                *state = ConnectivityState::TransientFailure;
             }
         };
 
-        self.get_state().await
+        *state
     }
 
     pub async fn make_connection(&mut self) -> Result<Connection, Status> {
         let mut retry = 0;
 
+        let mut state = self.state.lock().await;
+        let mut backoff = Backoff::new();
+
         loop {
-            match self.get_state().await {
+            match *state {
                 ConnectivityState::Ready => {
                     let transport = self
                         .transport
@@ -273,28 +269,28 @@ impl SubChannel {
                     return Ok(conn);
                 }
                 ConnectivityState::Connecting => {
-                    // let it go
+                    // TODO: wait for ready
                 }
                 ConnectivityState::Shutdown => {
                     unreachable!();
                 }
-                _ => {
-                    let state = self.connect().await;
-                    if state == ConnectivityState::Ready {
-                        let transport = self
-                            .transport
-                            .clone()
-                            .expect("transport must ok when ready");
-                        let conn = Connection::new(
-                            self.id.clone(),
-                            self.endpoint.uri.clone(),
-                            self.state.clone(),
-                            transport,
-                        );
-                        return Ok(conn);
-                    }
+                ConnectivityState::Idle | ConnectivityState::TransientFailure => {
+                    match self.inner_connect().await {
+                        Ok(transport) => {
+                            self.transport = transport;
+                            *state = ConnectivityState::Ready;
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::error!(endpoint=?self.endpoint, ?err, "connect failed");
+                            *state = ConnectivityState::TransientFailure;
+                            backoff.next();
+                        }
+                    };
                 }
             };
+
+            sleep_until(backoff.deadline()).await;
 
             retry += 1;
             if retry >= 3 {
@@ -303,27 +299,35 @@ impl SubChannel {
         }
     }
 
-    async fn inner_connect(&mut self) -> Result<(), Status> {
-        self.transport = match self.endpoint.credential {
+    async fn inner_connect(&self) -> Result<Option<SendRequest<BoxBody>>, Status> {
+        match self.endpoint.credential {
             Credential::InSecure => self.tcp_connect().await,
             Credential::SecureTls => self.tls_connect().await,
         }
-        .map(|sender| Some(sender))?;
-
-        Ok(())
+        .map(|sender| Some(sender))
     }
 
-    async fn tcp_connect(&mut self) -> Result<SendRequest<BoxBody>, Status> {
+    async fn tcp_connect(&self) -> Result<SendRequest<BoxBody>, Status> {
         let stream = TcpStream::connect(self.endpoint.addr).await?;
 
         let (sender, conn) = handshake(TokioExec, stream).await?;
 
-        tokio::task::spawn(async move { conn.await });
+        let id = self.id;
+        let state = self.state.clone();
+        tokio::task::spawn(async move {
+            if let Err(err) = conn.await {
+                tracing::error!(%err, "SubChannel[{:?}] transport failed", id);
+                *state.lock().await = ConnectivityState::TransientFailure;
+            } else {
+                tracing::debug!("SubChannel[{:?}] transport done", id);
+                *state.lock().await = ConnectivityState::Idle;
+            }
+        });
 
         Ok(sender)
     }
 
-    async fn tls_connect(&mut self) -> Result<SendRequest<BoxBody>, Status> {
+    async fn tls_connect(&self) -> Result<SendRequest<BoxBody>, Status> {
         unimplemented!()
     }
 }
@@ -394,11 +398,9 @@ impl LoadBalancer for PickFirstBalancer {
 struct Resolver;
 
 impl Resolver {
-    fn resolve(addr: &Uri) -> Result<Vec<SocketAddr>, Status> {
+    fn resolve(addr: &Uri) -> Result<impl Iterator<Item = SocketAddr>, Status> {
         match addr.host() {
             Some(host) => {
-                let addrs = ToSocketAddrs::to_socket_addrs(&(host, 0))?;
-
                 let port = match addr.port_u16() {
                     Some(port) => port,
                     None => match addr.scheme_str() {
@@ -410,12 +412,9 @@ impl Resolver {
                     },
                 };
 
-                Ok(addrs
-                    .map(|mut a| {
-                        a.set_port(port);
-                        a
-                    })
-                    .collect::<Vec<SocketAddr>>())
+                let addrs = ToSocketAddrs::to_socket_addrs(&(host, port))?;
+
+                Ok(addrs.into_iter())
             }
             None => {
                 return Err(Status::internal("invalid host in address"));
@@ -434,21 +433,22 @@ struct Backoff {
 
 impl Backoff {
     fn new() -> Self {
-        Backoff { backoff: INITIAL_BACKOFF }
+        Backoff {
+            backoff: INITIAL_BACKOFF,
+        }
     }
 
     fn deadline(&self) -> Instant {
-        let backoff = self.backoff;
-        Instant::now().checked_add(Duration::from_secs_f32(backoff)).unwrap()
+        let backoff = self.backoff + self.backoff * thread_rng().gen_range(-JITTER..=JITTER);
+        Instant::now()
+            .checked_add(Duration::from_secs_f32(backoff))
+            .unwrap()
     }
 
     fn next(&mut self) {
-       self.backoff = f32::min(1.6 * self.backoff, MAX_BACKOFF);
+        self.backoff = f32::min(1.6 * self.backoff, MAX_BACKOFF);
     }
-
-
 }
-
 
 #[derive(Clone, Copy, Debug)]
 struct TokioExec;
