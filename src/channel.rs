@@ -13,7 +13,7 @@ use hyper::{Request, Response, Uri};
 use rand::{thread_rng, Rng};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::time::{sleep_until, Instant};
+use tokio::time::{sleep_until, timeout_at, Instant};
 
 use crate::status::{Code, Status};
 
@@ -29,7 +29,7 @@ where
 
 #[derive(Clone)]
 pub struct Channel {
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Mutex<ConnectionManager>>,
     load_balancer: Arc<Mutex<Box<dyn LoadBalancer + Send + Sync>>>,
 }
 
@@ -57,11 +57,14 @@ impl Channel {
             credentail: Credential::InSecure,
         };
 
-        let inner = Inner::new(opts);
+        let mut inner = ConnectionManager::new(opts);
+        let balancer = RandomBalancer::new();
+
+        inner.init();
 
         Ok(Channel {
             inner: Arc::new(Mutex::new(inner)),
-            load_balancer: Arc::new(Mutex::new(Box::new(PickFirstBalancer::new()))),
+            load_balancer: Arc::new(Mutex::new(Box::new(balancer))),
         })
     }
 
@@ -78,16 +81,23 @@ impl Channel {
     }
 }
 
-struct Inner {
+struct ConnectionManager {
     opts: Opts,
     conns: BTreeMap<ChannelId, SubChannel>,
 }
 
-impl Inner {
+impl ConnectionManager {
     fn new(opts: Opts) -> Self {
-        Inner {
+        ConnectionManager {
             opts,
             conns: BTreeMap::new(),
+        }
+    }
+
+    pub fn init(&mut self) {
+        for endpoint in self.resolve_addrs() {
+            let conn = SubChannel::new(endpoint);
+            self.conns.insert(conn.id, conn);
         }
     }
 
@@ -96,6 +106,10 @@ impl Inner {
             Some(channel) => channel.make_connection().await,
             None => Err(Status::internal("can not request connection")),
         }
+    }
+
+    fn get_conns(&self) -> Vec<ChannelId> {
+        self.conns.keys().cloned().collect()
     }
 
     fn get_opts(&self) -> &Opts {
@@ -114,17 +128,25 @@ impl Inner {
         }
     }
 
-    pub fn resolve_addrs(&self) -> Result<Vec<Endpoint>, Status> {
+    pub fn resolve_addrs(&self) -> Vec<Endpoint> {
         let mut endpoints = Vec::new();
 
-        for uri in &self.get_opts().uris.clone() {
-            for addr in Resolver::resolve(uri)? {
-                let endpoint = Endpoint::new(uri.clone(), addr, self.get_opts().credentail.clone());
-                endpoints.push(endpoint);
+        for uri in &self.get_opts().uris {
+            match Resolver::resolve(uri) {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        let endpoint =
+                            Endpoint::new(uri.clone(), addr, self.get_opts().credentail.clone());
+                        endpoints.push(endpoint);
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(?err, ?uri, "resolve failed");
+                }
             }
         }
 
-        Ok(endpoints)
+        endpoints
     }
 }
 
@@ -233,78 +255,95 @@ impl SubChannel {
     pub async fn connect(&mut self) -> ConnectivityState {
         let mut state = self.state.lock().await;
 
+        *state = ConnectivityState::Connecting;
         match self.inner_connect().await {
-            Ok(transport) => {
-                self.transport = transport;
+            Some(transport) => {
+                self.transport = Some(transport);
                 *state = ConnectivityState::Ready;
             }
-            Err(err) => {
-                tracing::error!(endpoint=?self.endpoint, ?err, "connect failed");
+            None => {
                 *state = ConnectivityState::TransientFailure;
             }
-        };
+        }
 
         *state
     }
 
     pub async fn make_connection(&mut self) -> Result<Connection, Status> {
-        let mut retry = 0;
-
         let mut state = self.state.lock().await;
-        let mut backoff = Backoff::new();
 
-        loop {
-            match *state {
-                ConnectivityState::Ready => {
-                    let transport = self
-                        .transport
-                        .clone()
-                        .expect("transport must ok when ready");
-                    let conn = Connection {
-                        id: self.id.clone(),
-                        uri: self.endpoint.uri.clone(),
-                        state: self.state.clone(),
-                        transport,
-                    };
-                    return Ok(conn);
+        // do connect when not ready
+        if *state == ConnectivityState::Idle || *state == ConnectivityState::TransientFailure {
+            *state = ConnectivityState::Connecting;
+            match self.inner_connect().await {
+                Some(transport) => {
+                    self.transport = Some(transport);
+                    *state = ConnectivityState::Ready;
                 }
-                ConnectivityState::Connecting => {
-                    // TODO: wait for ready
+                None => {
+                    *state = ConnectivityState::TransientFailure;
                 }
-                ConnectivityState::Shutdown => {
-                    unreachable!();
-                }
-                ConnectivityState::Idle | ConnectivityState::TransientFailure => {
-                    match self.inner_connect().await {
-                        Ok(transport) => {
-                            self.transport = transport;
-                            *state = ConnectivityState::Ready;
-                            continue;
-                        }
-                        Err(err) => {
-                            tracing::error!(endpoint=?self.endpoint, ?err, "connect failed");
-                            *state = ConnectivityState::TransientFailure;
-                            backoff.next();
-                        }
-                    };
-                }
-            };
+            }
+        }
 
-            sleep_until(backoff.deadline()).await;
+        match *state {
+            ConnectivityState::Ready => {
+                let transport = self
+                    .transport
+                    .clone()
+                    .expect("transport must not None when ConnectivityState::Ready");
 
-            retry += 1;
-            if retry >= 3 {
-                return Err(Status::internal("request connection failed"));
+                let conn = Connection::new(
+                    self.id,
+                    self.endpoint.uri.clone(),
+                    self.state.clone(),
+                    transport,
+                );
+                Ok(conn)
+            }
+            ConnectivityState::TransientFailure => Err(Status::internal("make connection failed")),
+            _ => {
+                unreachable!("make_connection, state={:?}", *state);
             }
         }
     }
 
-    async fn inner_connect(&self) -> Result<Option<SendRequest<BoxBody>>, Status> {
+    async fn inner_connect(&self) -> Option<SendRequest<BoxBody>> {
+        let mut retrier = Retrier::new();
+
+        loop {
+            match timeout_at(retrier.connect_deadline(), self.build_transport()).await {
+                Ok(ret) => {
+                    match ret {
+                        Ok(transport) => {
+                            return Some(transport);
+                        }
+                        Err(err) => {
+                            tracing::error!(endpoint=?self.endpoint, ?err, "connect failed");
+                            retrier.next();
+                        }
+                    };
+                }
+                Err(elapsed) => {
+                    tracing::error!(endpoint=?self.endpoint, timeout=?elapsed, "connect timeout");
+                }
+            }
+
+            sleep_until(retrier.deadline()).await;
+
+            retrier.next();
+
+            if retrier.retry >= retrier.max_retry() {
+                return None;
+            }
+        }
+    }
+
+    async fn build_transport(&self) -> Result<SendRequest<BoxBody>, Status> {
         match self.endpoint.credential {
             Credential::InSecure => self.tcp_connect().await,
             Credential::SecureTls => self.tls_connect().await,
         }
-        .map(|sender| Some(sender))
     }
 
     async fn tcp_connect(&self) -> Result<SendRequest<BoxBody>, Status> {
@@ -352,7 +391,7 @@ pub enum Credential {
 
 #[async_trait::async_trait]
 trait LoadBalancer {
-    async fn pick(&mut self, channel: &mut Inner) -> Result<ChannelId, Status>;
+    async fn pick(&mut self, channel: &mut ConnectionManager) -> Result<ChannelId, Status>;
 }
 
 struct PickFirstBalancer {
@@ -367,31 +406,56 @@ impl PickFirstBalancer {
 
 #[async_trait::async_trait]
 impl LoadBalancer for PickFirstBalancer {
-    async fn pick(&mut self, channel: &mut Inner) -> Result<ChannelId, Status> {
+    async fn pick(&mut self, manager: &mut ConnectionManager) -> Result<ChannelId, Status> {
         match self.prefer {
             Some(id) => {
                 return Ok(id);
             }
             None => {
+                let conns = manager.get_conns();
+                if conns.is_empty() {
+                    return Err(Status::internal("no SubChannels"));
+                }
                 // try connect on one by one
-                let endpoints = channel.resolve_addrs()?;
-                for endpoint in &endpoints {
-                    match channel.connect_endpoint(endpoint.clone()).await {
-                        Ok(id) => {
+                for id in conns {
+                    match manager.make_connection(id).await {
+                        Ok(_) => {
                             self.prefer = Some(id);
                             return Ok(id);
                         }
                         Err(err) => {
-                            tracing::trace!(?endpoint, ?err, "connect endpoint failed");
+                            tracing::error!(?id, ?err, "make_connection failed");
                         }
                     }
                 }
 
-                tracing::error!(?endpoints, "all endpoints were failed to connected!");
+                tracing::error!("all subchannel were failed to connected!");
 
                 return Err(Status::internal("can not pick connection"));
             }
         }
+    }
+}
+
+struct RandomBalancer {}
+
+impl RandomBalancer {
+    pub fn new() -> Self {
+        RandomBalancer {}
+    }
+}
+
+#[async_trait::async_trait]
+impl LoadBalancer for RandomBalancer {
+    async fn pick(&mut self, manager: &mut ConnectionManager) -> Result<ChannelId, Status> {
+        let conns = manager.get_conns();
+        if conns.is_empty() {
+            return Err(Status::internal("no SubChannels"));
+        }
+
+        let chosen = thread_rng().gen_range(0..conns.len());
+
+        Ok(conns[chosen])
     }
 }
 
@@ -416,9 +480,7 @@ impl Resolver {
 
                 Ok(addrs.into_iter())
             }
-            None => {
-                return Err(Status::internal("invalid host in address"));
-            }
+            None => Err(Status::internal("invalid host in address")),
         }
     }
 }
@@ -426,16 +488,26 @@ impl Resolver {
 const INITIAL_BACKOFF: f32 = 1.0;
 const MAX_BACKOFF: f32 = 120.0;
 const JITTER: f32 = 0.2;
+const MIN_CONNECT_TIMEOUT: f32 = 20.0;
 
-struct Backoff {
+struct Retrier {
     backoff: f32,
+    retry: usize,
 }
 
-impl Backoff {
+impl Retrier {
     fn new() -> Self {
-        Backoff {
+        Retrier {
             backoff: INITIAL_BACKOFF,
+            retry: 0,
         }
+    }
+
+    fn connect_deadline(&self) -> Instant {
+        let timeout = f32::max(self.backoff, MIN_CONNECT_TIMEOUT);
+        Instant::now()
+            .checked_add(Duration::from_secs_f32(timeout))
+            .unwrap()
     }
 
     fn deadline(&self) -> Instant {
@@ -447,6 +519,11 @@ impl Backoff {
 
     fn next(&mut self) {
         self.backoff = f32::min(1.6 * self.backoff, MAX_BACKOFF);
+        self.retry += 1;
+    }
+
+    fn max_retry(&self) -> usize {
+        4
     }
 }
 

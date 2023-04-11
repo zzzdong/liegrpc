@@ -77,7 +77,7 @@ where
     pub fn into_stream(self, path: &str) -> hyper::Request<BoxBody> {
         let Request { metadata, message } = self;
 
-        let s = message.map(|m| ProstEncoder::new().encode(&m).map(|b| Frame::data(b)));
+        let s = message.map(|m| ProstEncoder::new().encode(&m).map(Frame::data));
 
         let payload = StreamBody::new(s);
 

@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr, convert::Infallible};
+use std::{convert::Infallible, fmt, str::FromStr};
 
 use bytes::Bytes;
 use hyper::http;
@@ -211,4 +211,3 @@ impl From<prost::DecodeError> for Status {
         Status::internal("prost decode failed").with_cause(err)
     }
 }
-
