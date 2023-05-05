@@ -1,3 +1,4 @@
+use hyper::Uri;
 use liegrpc::{
     client::GrpcClient,
     grpc::{Request, Response},
@@ -20,8 +21,8 @@ pub struct HelloReply {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let uri = "http://127.0.0.1:50001";
-    let mut client = liegrpc::client::Client::new([uri].iter()).unwrap();
+    let uri = Uri::from_static("http://127.0.0.1:50001");
+    let mut client = liegrpc::client::Client::new(uri).unwrap();
 
     let req = Request::new(HelloRequest {
         name: "tom".to_owned(),

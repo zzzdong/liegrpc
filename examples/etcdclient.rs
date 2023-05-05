@@ -1275,6 +1275,7 @@ impl AlarmType {
 }
 
 use futures::StreamExt;
+use hyper::Uri;
 use liegrpc::{
     client::GrpcClient,
     grpc::{Request, Response, Streaming},
@@ -1284,8 +1285,8 @@ use liegrpc::{
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let uri = "http://127.0.0.1:2379";
-    let mut client = liegrpc::client::Client::new([uri].iter()).unwrap();
+    let uri = Uri::from_static("http://127.0.0.1:2379");
+    let mut client = liegrpc::client::Client::new(uri).unwrap();
 
     let mut req = RangeRequest::default();
 

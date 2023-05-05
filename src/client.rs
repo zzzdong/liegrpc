@@ -1,4 +1,5 @@
 use futures::Stream;
+use hyper::Uri;
 
 use crate::{
     channel::Channel,
@@ -52,8 +53,8 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(target: impl Iterator<Item = impl AsRef<str>>) -> Result<Self, Status> {
-        let channel = Channel::new(target)?;
+    pub fn new(uri: Uri) -> Result<Self, Status> {
+        let channel = Channel::new(uri)?;
 
         Ok(Client { channel })
     }

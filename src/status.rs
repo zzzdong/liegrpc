@@ -165,8 +165,12 @@ impl Status {
         Ok(Status::new(code, message).with_detail(detail))
     }
 
-    pub fn internal(message: impl ToString) -> Self {
+    pub(crate) fn internal(message: impl ToString) -> Self {
         Self::new(Code::Internal, message)
+    }
+
+    pub(crate) fn invalid_argument(message: impl ToString) -> Self {
+        Self::new(Code::InvalidArgument, message)
     }
 }
 
