@@ -53,8 +53,8 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(uri: Uri) -> Result<Self, Status> {
-        let channel = Channel::new(uri)?;
+    pub fn new(target: impl AsRef<str>) -> Result<Self, Status> {
+        let channel = Channel::new(target)?;
 
         Ok(Client { channel })
     }

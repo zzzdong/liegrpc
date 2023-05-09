@@ -146,14 +146,11 @@ where
     pub async fn new_unary(resp: hyper::Response<Incoming>) -> Result<Self, Status> {
         let (mut parts, body) = resp.into_parts();
 
-        let status = if parts.status != hyper::StatusCode::OK {
-            Status::from_http_status(parts.status)
-        } else {
-            Status::from_header_map(&parts.headers)?
-        };
-
-        if !status.is_ok() {
-            return Err(status);
+        if parts.status != hyper::StatusCode::OK {
+            let status = Status::from_http_status(parts.status);
+            if !status.is_ok() {
+                return Err(status);
+            }
         }
 
         let mut streaming = Streaming::new(body);
@@ -191,14 +188,9 @@ where
     pub async fn new_streaming(resp: hyper::Response<Incoming>) -> Result<Self, Status> {
         let (parts, body) = resp.into_parts();
 
-        let status = if parts.status != hyper::StatusCode::OK {
-            Status::from_http_status(parts.status)
-        } else {
-            Status::from_header_map(&parts.headers)?
-        };
-
-        if !status.is_ok() {
-            return Err(status);
+         if parts.status != hyper::StatusCode::OK {
+            let status = Status::from_http_status(parts.status);
+            return Err(status)
         }
 
         let mut metadata = MetadataMap::new();

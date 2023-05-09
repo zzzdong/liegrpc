@@ -21,7 +21,7 @@ pub struct HelloReply {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let uri = Uri::from_static("http://127.0.0.1:50001");
+    let uri = "ip:127.0.0.1:50001";
     let mut client = liegrpc::client::Client::new(uri).unwrap();
 
     let req = Request::new(HelloRequest {
